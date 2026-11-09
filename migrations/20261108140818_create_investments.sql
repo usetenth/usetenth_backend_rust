@@ -1,0 +1,3 @@
+CREATE TABLE investments (
+    id UUID PRIMARY KEY DEFAULT
+);
