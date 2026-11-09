@@ -10,8 +10,8 @@ mod handlers;
 mod models;
 mod routes;
 mod services;
-mod tm_client;
 mod utils;
+mod integrations;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,13 +22,13 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to install rustls crypto provider");
 
     let config = AppConfig::from_env()?;
-    let application_state = ApplicationState::new(config.clone()).await.unwrap();
+    let application_state = ApplicationState::new(config.clone()).await?;
     let router = routes::app_router(application_state);
 
     //TCP Listener to listen for connections
     let addrs = format!("0.0.0.0:{}", config.port);
     println!("Server listening at: http://localhost:{}", config.port);
-    let listener = tokio::net::TcpListener::bind(addrs).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addrs).await?;
 
     let _tunnel = match (config.ngrok, config.app_mode) {
         (Some(ngrok_config), AppMode::Development) => {
