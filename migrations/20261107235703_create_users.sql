@@ -6,8 +6,8 @@ CREATE TABLE users (
   username VARCHAR,
   email VARCHAR,
   password VARCHAR,
-  created_at TIMESTAMP,
-  updated_at TIMESTAMP,
+  created_at TIMESTAMPZ,
+  updated_at TIMESTAMPZ,
   verified verification_status,
   external_ref_id VARCHAR UNIQUE
 );

@@ -8,7 +8,7 @@ use axum::{
 use axum::http::HeaderMap;
 use chrono::Utc;
 use serde::Deserialize;
-
+use sqlx::query_as;
 use crate::app_state::ApplicationState;
 use crate::models::schemas::TelegramSession;
 use crate::services::response::{ApiResponse};
@@ -55,15 +55,16 @@ pub async fn get_webhook_updates(
     headers: HeaderMap,
     Json(payload): Json<WebhookUpdate>,
 ) {
-    let existing_session = sqlx::query_as::<_, TelegramSession>("SELECT update_id FROM telegram_sessions WHERE update_id = $1")
+    let existing_session = query_as::<_, TelegramSession>("SELECT update_id FROM telegram_sessions WHERE update_id = $1")
         .bind(payload.update_id)
         .fetch_one(&state.pool)
         .await?;
-    ApiResponse::ok("Suceess", serde_json::json!({}));
+    ApiResponse::ok("Success", serde_json::json!({}));
 
     let expiry = Utc::now() + chrono::Duration::hours(1);
     match (payload.message, payload.callback_query ){
         Some((message, callback_query)) => {
+            
         },
         None => {}
     }

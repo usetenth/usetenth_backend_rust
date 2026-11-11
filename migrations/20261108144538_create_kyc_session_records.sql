@@ -7,7 +7,7 @@ CREATE TABLE kyc_session_records IF NOT EXISTS (
     country VARCHAR NOT NULL,
     file_url VARCHAR,
     status VARCHAR NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT now(),
-    updated_at TIMESTAMP NOT NULL DEFAULT now(),
-    expiry TIMESTAMP NOT NULL DEFAULT now(),
+    created_at TIMESTAMPZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPZ NOT NULL DEFAULT now(),
+    expiry TIMESTAMPZ NOT NULL DEFAULT now(),
 );
