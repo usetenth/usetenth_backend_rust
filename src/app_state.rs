@@ -14,8 +14,7 @@ impl ApplicationState {
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(config.db_url.as_str())
-            .await
-            .unwrap();
+            .await?;
 
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))

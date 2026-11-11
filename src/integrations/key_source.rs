@@ -1,9 +1,3 @@
-//! Loads the True Markets API key.
-//!
-//! * Production  -> exported from a Turnkey secret (never from disk).
-//! * Development -> read from the file at `TM_KEY_FILE`.
-//!
-
 use super::auth::TrueMarketApiKey;
 use crate::config::{AppConfig, AppMode, TurnkeyConfig};
 use anyhow::{Context, Result, bail};
@@ -61,8 +55,8 @@ struct ActivityResult {
 struct ExportSecretsResult {
     secret_payloads: Vec<String>,
 }
-/// Enclave -> client message (`ServerSendMsg`). Field names follow Turnkey's
-/// SDK convention; verify against a live response.
+// Enclave -> client message (`ServerSendMsg`). Field names follow Turnkey's
+// SDK convention; verify against a live response.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerSendMsg {
@@ -146,8 +140,8 @@ async fn load_from_turnkey(tk: &TurnkeyConfig) -> Result<TrueMarketApiKey> {
         .context("Turnkey secret is not the expected True Markets key JSON")
 }
 
-/// `X-Stamp` header: base64url(JSON{publicKey, scheme, signature}) where the
-/// signature is a hex DER ECDSA P-256/SHA-256 signature over the body.
+// `X-Stamp` header: base64url(JSON{publicKey, scheme, signature}) where the
+// signature is a hex DER ECDSA P-256/SHA-256 signature over the body.
 fn stamp(body: &str, api_public_key_hex: &str, api_private_key_hex: &str) -> Result<String> {
     let sk_bytes = hex::decode(api_private_key_hex).context("TURNKEY_API_PRIVATE_KEY must be hex")?;
     let sk = SigningKey::from_slice(&sk_bytes).context("Invalid Turnkey API private key")?;

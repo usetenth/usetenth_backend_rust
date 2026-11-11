@@ -1,8 +1,3 @@
-//! Telegram bot core flow: parse a command, run it, reply.
-//!
-//! Anything that needs the gateway (portfolio, rule, deposit addresses,
-//! sellable holdings) lives in `bot_data.rs`.
-
 use crate::app_state::ApplicationState;
 use crate::models::schemas::InvestmentPlan;
 use crate::services::bot_data::{self, BotDeposit, BotPortfolio, BotRule};
@@ -12,7 +7,7 @@ use crate::services::kyc;
 use crate::utils::{escape_html as h, usd};
 use serde::Deserialize;
 
-// ---- Telegram update payload (only the fields the bot uses) ----
+// Telegram update payload (only the fields the bot uses)
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct TelegramUser {
@@ -38,7 +33,7 @@ pub struct Message {
 pub struct CallbackQuery {
     pub id: String,
     pub from: TelegramUser,
-    /// The message the pressed button was attached to.
+    // The message the pressed button was attached to.
     pub message: Option<Message>,
     pub data: Option<String>,
 }
@@ -50,12 +45,12 @@ pub struct TelegramUpdate {
     pub callback_query: Option<CallbackQuery>,
 }
 
-/// `/start abc` is how Telegram delivers a deep link's payload.
+// `/start abc` is how Telegram delivers a deep link's payload.
 pub fn parse_args(text: Option<&str>) -> Vec<&str> {
     text.unwrap_or("").split_whitespace().skip(1).collect()
 }
 
-/// `/portfolio@my_bot arg` -> `portfolio`
+// `/portfolio@my_bot arg` -> `portfolio`
 pub fn parse_command(text: Option<&str>) -> Option<String> {
     let first = text?.split_whitespace().next()?;
     let rest = first.strip_prefix('/')?;
@@ -66,8 +61,7 @@ pub fn parse_command(text: Option<&str>) -> Option<String> {
     Some(name.to_lowercase())
 }
 
-// ---- Copy. Plain language, no emoji; HTML for structure. ----
-
+// Copy. Plain language, no emoji; HTML for structure.
 pub mod copy {
     use super::*;
 
@@ -294,8 +288,8 @@ pub async fn handle_update(state: &ApplicationState, update: TelegramUpdate) -> 
     Ok(())
 }
 
-/// Moves the user to their next onboarding step, running every automatic
-/// step (gateway account, KYC) on the way, and tells them what happened.
+// Moves the user to their next onboarding step, running every automatic
+// step (gateway account, KYC) on the way, and tells them what happened.
 async fn continue_onboarding(state: &ApplicationState, chat_id: i64, from: &TelegramUser) -> anyhow::Result<()> {
     let mut verified_now = false;
     // Each pass advances one stage; the cap guards against a stage that never moves.
@@ -331,7 +325,7 @@ async fn continue_onboarding(state: &ApplicationState, chat_id: i64, from: &Tele
     Ok(())
 }
 
-/// True when the user has finished onboarding. Otherwise sends them to their next step.
+// True when the user has finished onboarding, otherwise sends them to their next step.
 async fn require_active(state: &ApplicationState, chat_id: i64, from: &TelegramUser) -> anyhow::Result<bool> {
     let ob = onboarding::ensure_user(state, from.id, from.username.as_deref()).await?;
     if ob.stage == Stage::Active {
@@ -408,7 +402,7 @@ async fn run_command(state: &ApplicationState, command: &str, chat_id: i64, from
     }
 }
 
-/// Commands that need a finished onboarding (verified user, active rule).
+// Commands that need a finished onboarding (verified user, active rule).
 async fn run_active_command(state: &ApplicationState, command: &str, chat_id: i64, from: &TelegramUser) -> anyhow::Result<()> {
     match command {
         "portfolio" => {
