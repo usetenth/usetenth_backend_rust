@@ -33,17 +33,13 @@ pub struct TrueMarketClient {
 }
 
 impl TrueMarketClient {
-    pub fn new(config: AppConfig, retry_duration: u16) -> anyhow::Result<Self> {
+    pub async fn new(config: AppConfig, retry_duration: u16) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to build True Markets HTTP client")?;
 
-        let key_path = std::path::PathBuf::from(&config.true_market_key_file_path);
-        let key_contents = std::fs::read_to_string(&key_path)
-            .with_context(|| format!("Failed to read True Markets key file at {}", key_path.display()))?;
-        let api_key: TrueMarketApiKey = serde_json::from_str(&key_contents)
-            .context("True Markets API key file is not valid expected JSON/JWK")?;
+        let api_key = super::key_source::load_api_key(&config).await?;
 
         let base_url = config.true_market_base_url.trim_end_matches('/').to_string();
         // Configure this separately for UAT vs production if Accounts API has a different host.

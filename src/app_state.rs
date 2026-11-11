@@ -6,6 +6,7 @@ use crate::config::AppConfig;
 pub struct ApplicationState {
     pub pool: Pool<Postgres>,
     pub config: AppConfig,
+    pub http: reqwest::Client,
 }
 
 impl ApplicationState {
@@ -16,6 +17,10 @@ impl ApplicationState {
             .await
             .unwrap();
 
-        Ok(ApplicationState { pool, config })
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+
+        Ok(ApplicationState { pool, config, http })
     }
 }

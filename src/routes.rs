@@ -7,17 +7,19 @@ use crate::{
 use crate::services::response::ApiResponse;
 
 pub fn app_router(state: ApplicationState) -> Router {
-    let application_router = Router::new()
-        .route("/", get(root))
-        .route("/health", get(health))
+    // Only the webhook requires Telegram's secret token; / and /health stay public.
+    let webhook = Router::new()
         .route("/webhook", get(get_webhook_updates).post(webhook_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             telegram_auth_middleware,
-        ))
-        .with_state(state);
+        ));
 
-    application_router
+    Router::new()
+        .route("/", get(root))
+        .route("/health", get(health))
+        .merge(webhook)
+        .with_state(state)
 }
 
 async fn root() -> &'static str {

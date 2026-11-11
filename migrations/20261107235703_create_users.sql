@@ -6,8 +6,8 @@ CREATE TABLE users (
   username VARCHAR,
   email VARCHAR,
   password VARCHAR,
-  created_at TIMESTAMPZ,
-  updated_at TIMESTAMPZ,
-  verified verification_status,
-  external_ref_id VARCHAR UNIQUE
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  verified verification_status NOT NULL DEFAULT 'unverified',
+  gateway_user_id VARCHAR UNIQUE
 );

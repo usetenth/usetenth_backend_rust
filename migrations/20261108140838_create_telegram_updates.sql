@@ -1,5 +1,5 @@
 CREATE TABLE telegram_updates (
-  id UUID UNIQUE PRIMARY KEY DEFAULT,
-  update_id VARCHAR,
-  created_at TIMESTAMPZ
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  update_id BIGINT NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
