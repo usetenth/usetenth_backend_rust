@@ -54,7 +54,7 @@ pub async fn get_webhook_updates(
     State(state): State<ApplicationState>,
     headers: HeaderMap,
     Json(payload): Json<WebhookUpdate>,
-) {
+) -> (StatusCode, Json<Response>) {
     let existing_session = query_as::<_, TelegramSession>("SELECT update_id FROM telegram_sessions WHERE update_id = $1")
         .bind(payload.update_id)
         .fetch_one(&state.pool)
