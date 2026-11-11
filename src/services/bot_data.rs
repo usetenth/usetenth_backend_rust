@@ -1,9 +1,3 @@
-//! Data the bot needs from the gateway / True Markets.
-//!
-//! TODO(gateway): these are the integration points still to be wired up.
-//! Until then they return `None`, and the bot replies "not available yet".
-//! None of these may call True Markets endpoints that move money.
-
 use crate::app_state::ApplicationState;
 use crate::models::schemas::InvestmentPlan;
 use crate::services::bot::TelegramUser;

@@ -1,15 +1,9 @@
-//! Onboarding state. The stage is derived from data, not stored:
-//!
-//!   no rule -> no gateway user -> not KYC-verified -> active
-//!
-//! A user's rule stays disabled and their wallet stays hidden until KYC passes.
-
 use crate::app_state::ApplicationState;
 use crate::models::schemas::{InvestmentPlan, VerificationStatus};
 use anyhow::{Result, bail};
 use uuid::Uuid;
 
-/// The only tenth percentages the bot offers.
+// The only tenth percentages the bot offers.
 pub const PERCENTAGES: [i16; 3] = [5, 10, 20];
 
 pub fn parse_percentage(s: &str) -> Option<i16> {
@@ -77,8 +71,8 @@ pub async fn ensure_user(state: &ApplicationState, telegram_id: i64, username: O
     Ok(Onboarding { user_id: row.id, stage })
 }
 
-/// Saves the user's tenth. A new rule starts disabled; changing an existing
-/// rule leaves its enabled flag alone.
+// Saves the user's tenth. A new rule starts disabled; changing an existing
+// rule leaves its enabled flag alone.
 pub async fn save_rule(state: &ApplicationState, user_id: Uuid, percent: i16, plan: &InvestmentPlan) -> Result<()> {
     if !PERCENTAGES.contains(&percent) {
         bail!("unsupported tenth percentage: {percent}");
