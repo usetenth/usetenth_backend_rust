@@ -1,3 +1,7 @@
+pub mod money_out;
+pub mod admin;
+pub mod mobile;
+pub mod auth;
 pub mod assets;
 pub mod deposits;
 pub mod orders;
@@ -6,7 +10,3 @@ pub mod portfolio;
 pub mod trades;
 pub mod users;
 pub mod webhook;
-
-pub fn health() -> &'static str {
-    "Ok"
-}

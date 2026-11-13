@@ -3,11 +3,12 @@ use crate::models::schemas::InvestmentPlan;
 use crate::services::bot_data::{self, BotDeposit, BotPortfolio, BotRule};
 use crate::services::onboarding::{self, Stage};
 use crate::services::telegram_service::{Button, TelegramService};
+use crate::services::auth;
+use crate::config::KycMode;
 use crate::services::kyc;
 use crate::utils::{escape_html as h, usd};
 use serde::Deserialize;
 
-// Telegram update payload (only the fields the bot uses)
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct TelegramUser {
@@ -91,6 +92,7 @@ pub mod copy {
             "/sell  Sell what you bought",
             "/deposit  How to add funds, with your deposit address",
             "/address  Just your deposit addresses",
+            "/login  Get a one-time code to sign in to the mobile app",
             "/withdraw  Take money out",
             "",
             "<blockquote>Open the app from any message to do more without leaving Telegram.</blockquote>",
@@ -140,7 +142,7 @@ pub mod copy {
     }
 
     pub fn sell_none() -> String {
-        "<b>Nothing to sell yet</b>\n\nYou can sell what you bought yourself. Buy a stock first, and it will show up here.".into()
+        "<b>Nothing to sell yet</b>\n\nYou do not hold any stocks yet. Once you do, they will show up here.".into()
     }
 
     pub fn sell(items: &[bot_data::BotSellable]) -> String {
@@ -175,12 +177,30 @@ pub mod copy {
         "<b>We could not finish setting up your account</b>\n\nYour tenth is saved. Tap below to try again.".into()
     }
 
+    pub fn kyc_needed() -> String {
+        "<b>Verify your identity</b>\n\nWe need your name and NIN to switch your tenth on. It takes about a minute, and your NIN is never stored in the clear.".into()
+    }
+
+    pub fn kyc_pending() -> String {
+        "<b>We are checking your details</b>\n\nThis usually takes a few seconds. We will message you here as soon as it is done.".into()
+    }
+
+    pub fn kyc_review() -> String {
+        "<b>We are taking a closer look</b>\n\nYour details need a quick manual check. We will message you here as soon as it is done.".into()
+    }
+
     pub fn kyc_done() -> String {
         "<b>You are verified</b>\n\nYour tenth is now active.".into()
     }
 
     pub fn wallet_pending() -> String {
         "<b>Your wallet is being prepared</b>\n\nYour deposit address will show here as soon as it is ready. Send /address to check.".into()
+    }
+
+    pub fn login_code(code: &str) -> String {
+        format!(
+            "<b>Your app code</b>\n\n<code>{code}</code>\n\nEnter it in the app within 5 minutes. It works once.\n\n<blockquote>Never share this code. We will never ask for it in a chat.</blockquote>"
+        )
     }
 
     pub fn unavailable() -> String {
@@ -215,8 +235,7 @@ pub mod copy {
 }
 
 
-// Telegram retries webhooks, so each update is processed once.
-// Returns false when this update was already claimed.
+// Telegram retries webhooks, so an update is processed once; returns false if already claimed.
 async fn claim_update(state: &ApplicationState, update_id: i64) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "INSERT INTO telegram_updates (update_id) VALUES ($1) ON CONFLICT (update_id) DO NOTHING",
@@ -227,7 +246,6 @@ async fn claim_update(state: &ApplicationState, update_id: i64) -> anyhow::Resul
     Ok(result.rows_affected() == 1)
 }
 
-// ---- Flow ----
 
 fn web_button(state: &ApplicationState, path: &str, text: &str) -> Vec<Button> {
     match &state.config.web_app_url {
@@ -240,7 +258,7 @@ fn web_button(state: &ApplicationState, path: &str, text: &str) -> Vec<Button> {
 }
 
 async fn send(state: &ApplicationState, chat_id: i64, text: &str, buttons: &[Button]) -> anyhow::Result<()> {
-    TelegramService::send_message(&state.http, &state.config.telegram_bot_token, chat_id, text, buttons).await
+    TelegramService::send_message(state, chat_id, text, buttons).await
 }
 
 fn percentage_buttons() -> Vec<Button> {
@@ -267,7 +285,7 @@ pub async fn handle_update(state: &ApplicationState, update: TelegramUpdate) -> 
 
     if let Some(callback) = update.callback_query {
         let chat_id = callback.message.as_ref().map(|m| m.chat.id).unwrap_or(callback.from.id);
-        let _ = TelegramService::answer_callback_query(&state.http, &state.config.telegram_bot_token, &callback.id).await;
+        let _ = TelegramService::answer_callback_query(state, &callback.id).await;
         let data = callback.data.clone().unwrap_or_default();
         if let Err(error) = run_callback(state, &data, chat_id, &callback.from).await {
             eprintln!("Telegram callback failed: {data}: {error:#}");
@@ -288,8 +306,7 @@ pub async fn handle_update(state: &ApplicationState, update: TelegramUpdate) -> 
     Ok(())
 }
 
-// Moves the user to their next onboarding step, running every automatic
-// step (gateway account, KYC) on the way, and tells them what happened.
+// Moves the user to their next onboarding step, running automatic steps on the way.
 async fn continue_onboarding(state: &ApplicationState, chat_id: i64, from: &TelegramUser) -> anyhow::Result<()> {
     let mut verified_now = false;
     // Each pass advances one stage; the cap guards against a stage that never moves.
@@ -307,8 +324,19 @@ async fn continue_onboarding(state: &ApplicationState, chat_id: i64, from: &Tele
                 }
             },
             Stage::NeedsKyc => {
-                kyc::run(state, ob.user_id).await?;
-                verified_now = true;
+                if state.config.kyc.mode == KycMode::Auto {
+                    kyc::auto_approve(state, ob.user_id).await?;
+                    verified_now = true;
+                } else {
+                    let status = kyc::current(state, ob.user_id).await.map_err(|e| anyhow::anyhow!("{e}"))?.status;
+                    let text = match status.as_str() {
+                        "pending" => copy::kyc_pending(),
+                        "review" => copy::kyc_review(),
+                        _ => copy::kyc_needed(),
+                    };
+                    let buttons = if status == "pending" || status == "review" { vec![] } else { web_button(state, "/verify", "Verify my identity") };
+                    return send(state, chat_id, &text, &buttons).await;
+                }
             }
             Stage::Active => {
                 if verified_now {
@@ -382,6 +410,10 @@ async fn run_command(state: &ApplicationState, command: &str, chat_id: i64, from
             continue_onboarding(state, chat_id, from).await
         }
         "help" => send(state, chat_id, &copy::help(), &[]).await,
+        "login" => {
+            let code = auth::issue_telegram_code(state, from.id, from.username.as_deref()).await?;
+            send(state, chat_id, &copy::login_code(&code), &[]).await
+        }
         "tenth" => {
             let ob = onboarding::ensure_user(state, from.id, from.username.as_deref()).await?;
             if ob.stage == Stage::NeedsRule {

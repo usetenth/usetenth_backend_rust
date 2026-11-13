@@ -1,8 +1,8 @@
+use crate::app_state::ApplicationState;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-// An inline keyboard button.
 #[derive(Clone, Debug)]
 pub enum Button {
     // Opens the web app.
@@ -33,15 +33,8 @@ struct TelegramReply {
 pub struct TelegramService;
 
 impl TelegramService {
-    // Sends an HTML message. One button per row so long labels stay readable.
-    // Text is HTML: callers must escape anything that is not their own markup.
-    pub async fn send_message(
-        http: &reqwest::Client,
-        bot_token: &str,
-        chat_id: i64,
-        text: &str,
-        buttons: &[Button],
-    ) -> Result<()> {
+    // Sends an HTML message, one button per row; callers must escape text that isn't their own markup.
+    pub async fn send_message(state: &ApplicationState, chat_id: i64, text: &str, buttons: &[Button]) -> Result<()> {
         let mut body = json!({
             "chat_id": chat_id,
             "text": text,
@@ -52,23 +45,21 @@ impl TelegramService {
             let rows: Vec<Value> = buttons.iter().map(|b| json!([b.to_json()])).collect();
             body["reply_markup"] = json!({ "inline_keyboard": rows });
         }
-        Self::call(http, bot_token, "sendMessage", &body).await
+        Self::call(state, "sendMessage", &body).await
     }
 
     // Stops the loading spinner on a pressed inline button.
-    pub async fn answer_callback_query(
-        http: &reqwest::Client,
-        bot_token: &str,
-        callback_query_id: &str,
-    ) -> Result<()> {
+    pub async fn answer_callback_query(state: &ApplicationState, callback_query_id: &str) -> Result<()> {
         let body = json!({ "callback_query_id": callback_query_id });
-        Self::call(http, bot_token, "answerCallbackQuery", &body).await
+        Self::call(state, "answerCallbackQuery", &body).await
     }
 
-    async fn call(http: &reqwest::Client, bot_token: &str, method: &str, body: &Value) -> Result<()> {
+    async fn call(state: &ApplicationState, method: &str, body: &Value) -> Result<()> {
         // The bot token is part of the URL, so strip the URL from any reqwest error.
-        let response = http
-            .post(format!("https://api.telegram.org/bot{bot_token}/{method}"))
+        let url = format!("{}/bot{}/{method}", state.config.telegram_api_base, state.config.telegram_bot_token);
+        let response = state
+            .http
+            .post(url)
             .json(body)
             .send()
             .await

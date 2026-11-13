@@ -1,4 +1,5 @@
 use crate::app_state::ApplicationState;
+use crate::integrations::types::{ChainFamily, CreateGatewayUserRequest};
 use crate::models::schemas::{InvestmentPlan, VerificationStatus};
 use anyhow::{Result, bail};
 use uuid::Uuid;
@@ -19,7 +20,8 @@ pub fn parse_plan(s: &str) -> Option<InvestmentPlan> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Stage {
     NeedsRule,
     NeedsGateway,
@@ -41,9 +43,12 @@ struct Row {
     has_rule: bool,
 }
 
-/// Creates the user on first contact, refreshes their username, and returns
-/// where they are in onboarding.
-pub async fn ensure_user(state: &ApplicationState, telegram_id: i64, username: Option<&str>) -> Result<Onboarding> {
+// Creates the user on first contact, refreshes their username and returns their stage.
+pub async fn ensure_user(
+    state: &ApplicationState,
+    telegram_id: i64,
+    username: Option<&str>,
+) -> Result<Onboarding> {
     let row: Row = sqlx::query_as(
         "WITH u AS (
              INSERT INTO users (telegram_id, username) VALUES ($1, $2)
@@ -59,7 +64,15 @@ pub async fn ensure_user(state: &ApplicationState, telegram_id: i64, username: O
     .fetch_one(&state.pool)
     .await?;
 
-    let stage = if !row.has_rule {
+    let stage = stage_from(&row);
+    Ok(Onboarding {
+        user_id: row.id,
+        stage,
+    })
+}
+
+fn stage_from(row: &Row) -> Stage {
+    if !row.has_rule {
         Stage::NeedsRule
     } else if row.gateway_user_id.is_none() {
         Stage::NeedsGateway
@@ -67,13 +80,46 @@ pub async fn ensure_user(state: &ApplicationState, telegram_id: i64, username: O
         Stage::NeedsKyc
     } else {
         Stage::Active
-    };
-    Ok(Onboarding { user_id: row.id, stage })
+    }
 }
 
-// Saves the user's tenth. A new rule starts disabled; changing an existing
-// rule leaves its enabled flag alone.
-pub async fn save_rule(state: &ApplicationState, user_id: Uuid, percent: i16, plan: &InvestmentPlan) -> Result<()> {
+// Where an existing user is in onboarding. Used by the mobile app, which knows the user id.
+pub async fn stage_of(state: &ApplicationState, user_id: Uuid) -> Result<Stage> {
+    let row: Row = sqlx::query_as(
+        "SELECT u.id, u.verified, u.gateway_user_id,
+                EXISTS (SELECT 1 FROM rules r WHERE r.user_id = u.id) AS has_rule
+         FROM users u WHERE u.id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(stage_from(&row))
+}
+
+// Runs every automatic step the user is ready for; a failed gateway call leaves them put, so calling again retries.
+pub async fn advance(state: &ApplicationState, user_id: Uuid) -> Result<Stage> {
+    for _ in 0..4 {
+        match stage_of(state, user_id).await? {
+            Stage::NeedsGateway => {
+                let gateway_user_id = provision_gateway_user(state, user_id).await?;
+                set_gateway_user_id(state, user_id, &gateway_user_id).await?;
+            }
+            Stage::NeedsKyc if state.config.kyc.mode == crate::config::KycMode::Auto => {
+                crate::services::kyc::auto_approve(state, user_id).await?
+            }
+            stage => return Ok(stage),
+        }
+    }
+    stage_of(state, user_id).await
+}
+
+// Saves the tenth; a new rule starts disabled and changing one keeps its enabled flag.
+pub async fn save_rule(
+    state: &ApplicationState,
+    user_id: Uuid,
+    percent: i16,
+    plan: &InvestmentPlan,
+) -> Result<()> {
     if !PERCENTAGES.contains(&percent) {
         bail!("unsupported tenth percentage: {percent}");
     }
@@ -90,17 +136,41 @@ pub async fn save_rule(state: &ApplicationState, user_id: Uuid, percent: i16, pl
     Ok(())
 }
 
-/// Creates the user's gateway (True Markets) account and returns its id.
-///
-/// TODO(gateway): call `TrueMarketClient::create_user`. Pass `user_id` as an
-/// idempotency / external reference so a retry can never create a second
-/// account. Not wired yet, so the bot tells the user setup is pending and
-/// offers a retry.
-pub async fn provision_gateway_user(_state: &ApplicationState, _user_id: Uuid) -> Result<String> {
-    bail!("gateway user provisioning is not wired yet")
+// Safe to retry: the signer key is idempotent, and a gateway rejection surfaces so the bot offers a retry.
+pub async fn provision_gateway_user(state: &ApplicationState, user_id: Uuid) -> Result<String> {
+    let signer_public_key = state.signing.ensure_user_key(user_id).await?;
+    let request = CreateGatewayUserRequest {
+        external_ref_id: user_id.to_string(),
+        signer_public_key,
+    };
+    let response = state
+        .tm_client
+        .create_user(&state.config.true_market_organization_id, &request)
+        .await?;
+
+    for wallet in &response.wallets {
+        let network = match wallet.chain_family {
+            ChainFamily::Evm => "evm",
+            ChainFamily::Solana => "solana",
+        };
+        sqlx::query(
+            "INSERT INTO wallets (user_id, address, network) VALUES ($1, $2, $3)
+             ON CONFLICT (user_id, network) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(&wallet.address)
+        .bind(network)
+        .execute(&state.pool)
+        .await?;
+    }
+    Ok(response.user_id)
 }
 
-pub async fn set_gateway_user_id(state: &ApplicationState, user_id: Uuid, gateway_user_id: &str) -> Result<()> {
+pub async fn set_gateway_user_id(
+    state: &ApplicationState,
+    user_id: Uuid,
+    gateway_user_id: &str,
+) -> Result<()> {
     // Only ever set once.
     sqlx::query("UPDATE users SET gateway_user_id = $2, updated_at = now() WHERE id = $1 AND gateway_user_id IS NULL")
         .bind(user_id)
