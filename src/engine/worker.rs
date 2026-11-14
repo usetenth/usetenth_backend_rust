@@ -20,7 +20,10 @@ const MAX_ORDERS_PER_TICK: usize = 20;
 
 pub async fn run(state: ApplicationState) {
     let cfg = state.config.engine.clone();
-    println!("Engine started (dry_run={}, poll={}s)", cfg.dry_run, cfg.poll_secs);
+    println!("Engine started (dry_run={}, poll={}s, deposits in {})", cfg.dry_run, cfg.poll_secs, cfg.settlement_symbols.join("/"));
+    if cfg.global_floor_micros > cfg.max_order_micros {
+        eprintln!("GLOBAL_FLOOR_USD is above MAX_ORDER_USD, so manual buys can never be in range");
+    }
     loop {
         tick(&state).await;
         tokio::time::sleep(Duration::from_secs(cfg.poll_secs)).await;
@@ -47,6 +50,7 @@ pub async fn tick(state: &ApplicationState) {
     log(super::withdrawals::notify(state).await, "notify withdrawals");
     log(reconcile(state).await, "reconcile orders");
     log(finalize_investments(&state.pool).await, "finalize investments");
+    log(notify_deposits(state).await, "notify deposits");
     log(notify_users(state).await, "notify users");
 }
 
@@ -87,6 +91,17 @@ pub async fn detect_deposits(state: &ApplicationState) -> anyhow::Result<()> {
     Ok(())
 }
 
+// A payment in a token that is not a settlement asset is skipped, so say so once instead of every poll.
+fn warn_once_ignored(source_id: &str, symbol: &str, settlement: &[String]) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let first = SEEN.get_or_init(Default::default).lock().unwrap().insert(source_id.to_string());
+    if first {
+        eprintln!("Ignored a received transfer of {symbol}: only {} count as deposits (set TM_SETTLEMENT_ASSET)", settlement.join(", "));
+    }
+}
+
 async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &str) -> anyhow::Result<()> {
     let symbols = &state.config.engine.settlement_symbols;
     let response = state.tm_client.list_transactions(gateway_id).await?;
@@ -99,6 +114,7 @@ async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &s
         let symbol = received.token_symbol.to_uppercase();
         let Some(micros) = parse_micros(&received.amount).filter(|m| *m > 0) else { continue };
         if !symbols.contains(&symbol) {
+            warn_once_ignored(&received.id.to_string(), &symbol, symbols);
             continue;
         }
         sqlx::query(
@@ -541,36 +557,82 @@ pub async fn finalize_investments(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn notify_users(state: &ApplicationState) -> anyhow::Result<()> {
-    let pool = &state.pool;
-    // Nobody to tell (no Telegram) or nothing real happened (simulated): just close them out.
-    sqlx::query(
-        "UPDATE investments i SET notified_at = now() FROM users u
-         WHERE u.id = i.user_id AND i.notified_at IS NULL
-           AND (i.status = 'simulated' OR u.telegram_id IS NULL) AND i.status IN ('completed', 'partial', 'failed', 'simulated')",
-    )
-    .execute(pool)
-    .await?;
+/// What a deposit notice says: the payment first, then what happens to the tenth.
+pub fn deposit_summary(amount_micros: i64, asset: &str, invest_micros: Option<i64>, status: Option<&str>, skip_reason: Option<&str>) -> String {
+    let arrived = format!("{} {asset} just arrived in your wallet.", usd(&format_micros(amount_micros)));
+    let next = match (invest_micros, status, skip_reason) {
+        (_, Some("simulated"), _) => " Test mode is on, so nothing was invested and it stays in your balance.".to_string(),
+        (Some(micros), Some(s), _) if micros > 0 && s != "skipped" && s != "failed" => {
+            format!(" We are investing your tenth, {}.", usd(&format_micros(micros)))
+        }
+        (_, Some("skipped"), Some("below_minimum")) => " It was too small to invest from, so it stays in your balance.".to_string(),
+        (_, Some("skipped"), Some("daily_limit")) => " You have reached today's investing limit, so it stays in your balance.".to_string(),
+        (_, Some("skipped"), _) => " Nothing was invested from this one, so it stays in your balance.".to_string(),
+        _ => String::new(),
+    };
+    format!("{arrived}{next}")
+}
 
-    let due: Vec<(Uuid, i64, String, i64)> = sqlx::query_as(
-        "SELECT i.id, u.telegram_id, i.status, i.invest_micros FROM investments i JOIN users u ON u.id = i.user_id
-         WHERE i.notified_at IS NULL AND u.telegram_id IS NOT NULL AND i.status IN ('completed', 'partial', 'failed') LIMIT 50",
+/// Announces every new deposit once, in the app's list and on Telegram, even when nothing is invested from it.
+pub async fn notify_deposits(state: &ApplicationState) -> anyhow::Result<()> {
+    let pool = &state.pool;
+    let due: Vec<(Uuid, Uuid, i64, String, Option<i64>, Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT d.id, d.user_id, d.amount_micros, d.asset, u.telegram_id, i.invest_micros, i.status, i.skip_reason
+         FROM deposits d JOIN users u ON u.id = d.user_id LEFT JOIN investments i ON i.deposit_id = d.id
+         WHERE d.notified_at IS NULL AND (i.id IS NOT NULL OR d.created_at < now() - interval '2 minutes')
+         ORDER BY d.created_at LIMIT 50",
     )
     .fetch_all(pool)
     .await?;
-    for (id, chat_id, status, invest_micros) in due {
-        let amount = usd(&format_micros(invest_micros));
-        let text = match status.as_str() {
-            "completed" => format!("<b>Your tenth is invested</b>\n\nWe invested {amount} from your latest payment."),
-            "partial" => format!("<b>Part of your tenth is invested</b>\n\nSome of your {amount} was invested. The rest stays in your balance and we are looking into it."),
-            _ => "<b>We could not invest your latest tenth</b>\n\nYour money is safe in your balance. We are looking into it.".into(),
-        };
-        match TelegramService::send_message(state, chat_id, &text, &[]).await {
-            Ok(()) => {
-                sqlx::query("UPDATE investments SET notified_at = now() WHERE id = $1").bind(id).execute(pool).await?;
+    for (id, user_id, amount, asset, chat, invest, status, skip) in due {
+        let body = deposit_summary(amount, &asset, invest, status.as_deref(), skip.as_deref());
+        sqlx::query(
+            "INSERT INTO notifications (user_id, kind, title, body, deposit_id) VALUES ($1, 'deposit', 'Payment received', $2, $3)
+             ON CONFLICT (deposit_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(&body)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        if let Some(chat_id) = chat {
+            let text = format!("<b>Payment received</b>\n\n{body}");
+            if let Err(error) = TelegramService::send_message(state, chat_id, &text, &[]).await {
+                eprintln!("Could not notify about deposit {id}: {error:#}");
+                continue;
             }
-            Err(error) => eprintln!("Could not notify about investment {id}: {error:#}"),
         }
+        sqlx::query("UPDATE deposits SET notified_at = now() WHERE id = $1").bind(id).execute(pool).await?;
+    }
+    Ok(())
+}
+
+pub async fn notify_users(state: &ApplicationState) -> anyhow::Result<()> {
+    let pool = &state.pool;
+    // Nothing real happened (simulated), so there is nothing to tell anyone.
+    sqlx::query("UPDATE investments SET notified_at = now() WHERE notified_at IS NULL AND status = 'simulated'").execute(pool).await?;
+
+    let due: Vec<(Uuid, Uuid, Option<i64>, String, i64)> = sqlx::query_as(
+        "SELECT i.id, i.user_id, u.telegram_id, i.status, i.invest_micros FROM investments i JOIN users u ON u.id = i.user_id
+         WHERE i.notified_at IS NULL AND i.status IN ('completed', 'partial', 'failed') LIMIT 50",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (id, user_id, chat, status, invest_micros) in due {
+        let amount = usd(&format_micros(invest_micros));
+        let (title, body) = match status.as_str() {
+            "completed" => ("Your tenth is invested", format!("We invested {amount} from your latest payment.")),
+            "partial" => ("Part of your tenth is invested", format!("Some of your {amount} was invested. The rest stays in your balance and we are looking into it.")),
+            _ => ("We could not invest your latest tenth", "Your money is safe in your balance. We are looking into it.".to_string()),
+        };
+        crate::services::notify::record(pool, user_id, "investment", id, title, &body).await?;
+        if let Some(chat_id) = chat {
+            if let Err(error) = TelegramService::send_message(state, chat_id, &format!("<b>{title}</b>\n\n{body}"), &[]).await {
+                eprintln!("Could not notify about investment {id}: {error:#}");
+                continue;
+            }
+        }
+        sqlx::query("UPDATE investments SET notified_at = now() WHERE id = $1").bind(id).execute(pool).await?;
     }
     Ok(())
 }

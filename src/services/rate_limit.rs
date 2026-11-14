@@ -10,10 +10,6 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// True when `key` has already hit `limit` events inside its current window.
     pub fn is_blocked(&self, key: &str, limit: u32, window: Duration) -> bool {
         let windows = self.windows.lock().unwrap();
@@ -47,7 +43,7 @@ mod tests {
 
     #[test]
     fn blocks_after_the_limit_and_recovers() {
-        let limiter = RateLimiter::new();
+        let limiter = RateLimiter::default();
         let window = Duration::from_millis(60);
         assert!(limiter.allow("a", 2, window));
         assert!(limiter.allow("a", 2, window));
@@ -59,7 +55,7 @@ mod tests {
 
     #[test]
     fn recording_failures_does_not_block_until_the_limit() {
-        let limiter = RateLimiter::new();
+        let limiter = RateLimiter::default();
         let window = Duration::from_secs(60);
         limiter.record("k", window);
         assert!(!limiter.is_blocked("k", 2, window));

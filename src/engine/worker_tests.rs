@@ -41,6 +41,8 @@ pub(crate) struct Mock {
     pub(crate) prembly_calls: Arc<AtomicUsize>,
     pub(crate) dojah_calls: Arc<AtomicUsize>,
     pub(crate) nin_name: Arc<Mutex<(String, String, String)>>,
+    pub(crate) assets_query: Arc<Mutex<String>>,
+    pub(crate) photo_down: Arc<AtomicBool>,
 }
 
 impl Mock {
@@ -67,6 +69,8 @@ impl Mock {
             prembly_calls: Default::default(),
             dojah_calls: Default::default(),
             nin_name: Arc::new(Mutex::new(("Adaeze".into(), "".into(), "Obi".into()))),
+            assets_query: Default::default(),
+            photo_down: Default::default(),
         }
     }
     pub(crate) fn creates(&self) -> usize {
@@ -183,6 +187,29 @@ async fn serve(mock: Mock) -> String {
         m.telegram.lock().unwrap().push(body);
         (StatusCode::OK, Json(json!({ "ok": true })))
     }
+    // Pulls one text field out of a multipart body; the picture bytes in between are ignored.
+    fn field(body: &str, name: &str) -> Option<String> {
+        let marker = format!("name=\"{name}\"\r\n\r\n");
+        let start = body.find(&marker)? + marker.len();
+        Some(body[start..start + body[start..].find("\r\n--")?].to_string())
+    }
+    async fn send_photo(State(m): State<Mock>, Path(_bot): Path<String>, body: axum::body::Bytes) -> (StatusCode, Json<Value>) {
+        if m.telegram_down.load(Ordering::SeqCst) || m.photo_down.load(Ordering::SeqCst) {
+            return (StatusCode::BAD_GATEWAY, Json(json!({ "ok": false, "description": "down" })));
+        }
+        let body = String::from_utf8_lossy(&body).to_string();
+        let mut message = json!({
+            "photo": true,
+            "chat_id": field(&body, "chat_id").and_then(|v| v.parse::<i64>().ok()),
+            "text": field(&body, "caption"),
+            "parse_mode": field(&body, "parse_mode"),
+        });
+        if let Some(markup) = field(&body, "reply_markup").and_then(|v| serde_json::from_str::<Value>(&v).ok()) {
+            message["reply_markup"] = markup;
+        }
+        m.telegram.lock().unwrap().push(message);
+        (StatusCode::OK, Json(json!({ "ok": true })))
+    }
     async fn prembly_nin(State(m): State<Mock>, Json(_): Json<Value>) -> (StatusCode, Json<Value>) {
         m.prembly_calls.fetch_add(1, Ordering::SeqCst);
         let (first, middle, last) = m.nin_name.lock().unwrap().clone();
@@ -202,6 +229,25 @@ async fn serve(mock: Mock) -> String {
         let (first, middle, last) = m.nin_name.lock().unwrap().clone();
         Json(json!({ "entity": { "first_name": first, "middle_name": middle, "last_name": last } }))
     }
+    async fn assets(State(m): State<Mock>, axum::extract::RawQuery(query): axum::extract::RawQuery) -> Json<Value> {
+        let query = query.unwrap_or_default();
+        *m.assets_query.lock().unwrap() = query.clone();
+        if !query.contains("asset_class=crypto,stock") {
+            return Json(json!({ "data": [] }));
+        }
+        let item = |id: &str, symbol: &str, name: &str, class: &str, chain: Option<&str>, tradeable: bool| {
+            json!({ "id": id, "symbol": symbol, "name": name, "asset_class": class, "status": "active", "tradeable": tradeable,
+                    "stable": false, "chain": chain, "networks": [], "order_types": [] })
+        };
+        Json(json!({ "data": [
+            item("aaaaaaaa-0000-4000-8000-000000000001", "AAPL", "Apple", "stock", Some("robinhood"), true),
+            item("aaaaaaaa-0000-4000-8000-000000000002", "AAPLC", "Apple", "stock", Some("base"), true),
+            item("aaaaaaaa-0000-4000-8000-000000000006", "AAPLX", "Apple", "stock", Some("solana"), true),
+            item("aaaaaaaa-0000-4000-8000-000000000003", "MSFT", "Microsoft", "stock", Some("robinhood"), true),
+            item("aaaaaaaa-0000-4000-8000-000000000004", "NVDA", "NVIDIA", "stock", Some("robinhood"), false),
+            item("aaaaaaaa-0000-4000-8000-000000000005", "BTC", "Bitcoin", "crypto", None, true),
+        ] }))
+    }
     async fn quote(Json(_): Json<Value>) -> Json<Value> {
         Json(json!({ "qty": "1", "price": "500", "notional": "500", "fee": "0.5" }))
     }
@@ -217,7 +263,9 @@ async fn serve(mock: Mock) -> String {
         .route("/v1/gateway/balances", get(balances))
         .route("/v1/gateway/portfolio", get(portfolio))
         .route("/v1/gateway/quotes", post(quote))
+        .route("/v1/gateway/assets", get(assets))
         .route("/telegram/{bot}/sendMessage", post(send_message))
+        .route("/telegram/{bot}/sendPhoto", post(send_photo))
         .route("/verification/vnin-basic", post(prembly_nin))
         .route("/api/v1/kyc/nin", get(dojah_nin))
         .with_state(mock);
@@ -368,8 +416,8 @@ async fn the_daily_limit_counts_earlier_investments(pool: PgPool) {
 
     let mut invested: Vec<i64> = sqlx::query_scalar("SELECT invest_micros FROM investments").fetch_all(&pool).await.unwrap();
     invested.sort();
-    // 2 USD remain under the cap, split 60/40: the 0.80 USD leg is under the 1 USD floor, so 1.20 is invested.
-    assert_eq!(invested, vec![1_200_000, 10_000_000]);
+    // 2 USD remain under the cap; split 60/40 the 0.80 leg is under the 1 USD floor, so the heavier stock takes all 2.
+    assert_eq!(invested, vec![2_000_000, 10_000_000]);
 }
 
 

@@ -5,7 +5,7 @@ use crate::services::onboarding::{self, Stage};
 use crate::services::telegram_service::{Button, TelegramService};
 use crate::services::auth;
 use crate::config::KycMode;
-use crate::services::kyc;
+use crate::services::{cards, kyc, step_up};
 use crate::utils::{escape_html as h, usd};
 use serde::Deserialize;
 
@@ -14,8 +14,6 @@ use serde::Deserialize;
 pub struct TelegramUser {
     pub id: i64,
     pub username: Option<String>,
-    pub first_name: Option<String>,
-    pub last_name: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -46,11 +44,6 @@ pub struct TelegramUpdate {
     pub callback_query: Option<CallbackQuery>,
 }
 
-// `/start abc` is how Telegram delivers a deep link's payload.
-pub fn parse_args(text: Option<&str>) -> Vec<&str> {
-    text.unwrap_or("").split_whitespace().skip(1).collect()
-}
-
 // `/portfolio@my_bot arg` -> `portfolio`
 pub fn parse_command(text: Option<&str>) -> Option<String> {
     let first = text?.split_whitespace().next()?;
@@ -65,22 +58,6 @@ pub fn parse_command(text: Option<&str>) -> Option<String> {
 // Copy. Plain language, no emoji; HTML for structure.
 pub mod copy {
     use super::*;
-
-    pub fn welcome() -> String {
-        [
-            "<b>Welcome to usetenth</b>",
-            "",
-            "Keep a tenth of every payment you receive. We invest it for you in tokenized stocks, so your money is working before you can spend it.",
-            "",
-            "<b>How it works</b>",
-            "1. Set your tenth: 5%, 10% or 20% of each payment",
-            "2. Get paid in stablecoins, as usual",
-            "3. We invest your tenth automatically",
-            "",
-            "<blockquote>The rest of every payment stays yours, always.</blockquote>",
-        ]
-        .join("\n")
-    }
 
     pub fn help() -> String {
         [
@@ -203,6 +180,22 @@ pub mod copy {
         )
     }
 
+    pub fn wallet_ready() -> String {
+        "<b>Your wallet is ready</b>\n\nOpen usetenth to see your wallet address, copy it or share it, and start receiving payments. We invest your tenth as each payment lands.".into()
+    }
+
+    pub fn terms() -> String {
+        "<b>Before you start</b>\n\nSee how usetenth works, what we do with your money and your details, and the terms we operate under. It takes two minutes.".into()
+    }
+
+    pub fn approved() -> String {
+        "<b>Approved</b>\n\nGo back to usetenth to finish.".into()
+    }
+
+    pub fn approval_expired() -> String {
+        "<b>That request has expired</b>\n\nStart it again in usetenth.".into()
+    }
+
     pub fn unavailable() -> String {
         "<b>Not available yet</b>\n\nThat is not switched on for your account yet. Please try again later.".into()
     }
@@ -247,7 +240,7 @@ async fn claim_update(state: &ApplicationState, update_id: i64) -> anyhow::Resul
 }
 
 
-fn web_button(state: &ApplicationState, path: &str, text: &str) -> Vec<Button> {
+pub(crate) fn web_button(state: &ApplicationState, path: &str, text: &str) -> Vec<Button> {
     match &state.config.web_app_url {
         Some(base) => vec![Button::WebApp {
             text: text.into(),
@@ -259,6 +252,17 @@ fn web_button(state: &ApplicationState, path: &str, text: &str) -> Vec<Button> {
 
 async fn send(state: &ApplicationState, chat_id: i64, text: &str, buttons: &[Button]) -> anyhow::Result<()> {
     TelegramService::send_message(state, chat_id, text, buttons).await
+}
+
+// A picture with the text as its caption; the same words go out as plain text if the picture cannot be sent.
+async fn send_card(state: &ApplicationState, chat_id: i64, card: Option<&'static [u8]>, text: &str, buttons: &[Button]) -> anyhow::Result<()> {
+    if let Some(png) = card {
+        match TelegramService::send_photo(state, chat_id, png, text, buttons).await {
+            Ok(()) => return Ok(()),
+            Err(error) => eprintln!("Card failed, sending text instead: {error:#}"),
+        }
+    }
+    send(state, chat_id, text, buttons).await
 }
 
 fn percentage_buttons() -> Vec<Button> {
@@ -314,7 +318,7 @@ async fn continue_onboarding(state: &ApplicationState, chat_id: i64, from: &Tele
         let ob = onboarding::ensure_user(state, from.id, from.username.as_deref()).await?;
         match ob.stage {
             Stage::NeedsRule => {
-                return send(state, chat_id, &copy::choose_percentage(), &percentage_buttons()).await;
+                return send_card(state, chat_id, Some(cards::welcome()), &copy::choose_percentage(), &percentage_buttons()).await;
             }
             Stage::NeedsGateway => match onboarding::provision_gateway_user(state, ob.user_id).await {
                 Ok(gateway_user_id) => onboarding::set_gateway_user_id(state, ob.user_id, &gateway_user_id).await?,
@@ -342,11 +346,15 @@ async fn continue_onboarding(state: &ApplicationState, chat_id: i64, from: &Tele
                 if verified_now {
                     send(state, chat_id, &copy::kyc_done(), &[]).await?;
                 }
-                // The wallet is only shown once KYC has passed.
-                return match bot_data::get_deposit(state, from).await? {
-                    Some(d) => send(state, chat_id, &copy::deposit(&d), &web_button(state, "/add-funds", "Use a different network")).await,
-                    None => send(state, chat_id, &copy::wallet_pending(), &[]).await,
-                };
+                // The address itself lives in the app, where it can be copied and shared.
+                match bot_data::get_deposit(state, from).await? {
+                    Some(_) => send(state, chat_id, &copy::wallet_ready(), &web_button(state, "/add-funds", "Open my wallet")).await?,
+                    None => send(state, chat_id, &copy::wallet_pending(), &[]).await?,
+                }
+                if verified_now {
+                    send(state, chat_id, &copy::terms(), &web_button(state, "/terms", "Read terms and policies")).await?;
+                }
+                return Ok(());
             }
         }
     }
@@ -377,6 +385,15 @@ async fn run_callback(state: &ApplicationState, data: &str, chat_id: i64, from: 
             save_and_continue(state, chat_id, from, percent, &plan).await
         }
         ["retry"] => continue_onboarding(state, chat_id, from).await,
+        ["ok", id] => {
+            let Ok(id) = id.parse::<uuid::Uuid>() else { return Ok(()) };
+            let text = if step_up::approve(state, from.id, id).await.map_err(|e| anyhow::anyhow!("{e}"))? {
+                copy::approved()
+            } else {
+                copy::approval_expired()
+            };
+            send(state, chat_id, &text, &[]).await
+        }
         ["tenth"] => send(state, chat_id, &copy::choose_percentage(), &percentage_buttons()).await,
         _ => Ok(()),
     }
@@ -403,10 +420,6 @@ async fn save_and_continue(
 async fn run_command(state: &ApplicationState, command: &str, chat_id: i64, from: &TelegramUser) -> anyhow::Result<()> {
     match command {
         "start" => {
-            let ob = onboarding::ensure_user(state, from.id, from.username.as_deref()).await?;
-            if ob.stage == Stage::NeedsRule {
-                send(state, chat_id, &copy::welcome(), &[]).await?;
-            }
             continue_onboarding(state, chat_id, from).await
         }
         "help" => send(state, chat_id, &copy::help(), &[]).await,
@@ -422,7 +435,8 @@ async fn run_command(state: &ApplicationState, command: &str, chat_id: i64, from
             let rule = bot_data::get_rule(state, from).await?;
             let mut buttons = vec![Button::callback("Change my tenth", "tenth")];
             buttons.extend(web_button(state, "/tenth", "Open my tenth"));
-            send(state, chat_id, &copy::tenth(rule.as_ref()), &buttons).await
+            let card = rule.as_ref().and_then(|r| cards::tenth(r.percent, &r.mix_name));
+            send_card(state, chat_id, card, &copy::tenth(rule.as_ref()), &buttons).await
         }
         "portfolio" | "deposit" | "address" | "buy" | "sell" | "withdraw" => {
             if !require_active(state, chat_id, from).await? {
@@ -494,8 +508,147 @@ mod tests {
     }
 
     #[test]
-    fn parses_args() {
-        assert_eq!(parse_args(Some("/start abc def")), vec!["abc", "def"]);
-        assert!(parse_args(Some("/start")).is_empty());
+    fn commands_reject_anything_that_is_not_a_plain_word() {
+        assert_eq!(parse_command(Some("/with-dash")), None);
+        assert_eq!(parse_command(Some("/start123")), None);
+        assert_eq!(parse_command(Some("  /Help  ")).as_deref(), Some("help"));
+        assert_eq!(parse_command(Some("/@bot")), None);
+        assert_eq!(parse_command(Some("/sell_all now")).as_deref(), Some("sell_all"));
+        assert_eq!(parse_command(Some("")), None);
+    }
+
+    fn portfolio(holdings: usize, gain: Option<&str>) -> BotPortfolio {
+        BotPortfolio {
+            cash: "12.50".into(),
+            value: "300.00".into(),
+            invested: "250.00".into(),
+            gain: gain.map(String::from),
+            holdings: (0..holdings).map(|i| bot_data::BotHolding { name: format!("Stock {i}"), amount: "1".into() }).collect(),
+        }
+    }
+
+    #[test]
+    fn the_help_lists_every_command() {
+        let help = copy::help();
+        for command in ["/portfolio", "/tenth", "/buy", "/sell", "/deposit", "/address", "/login", "/withdraw"] {
+            assert!(help.contains(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn the_wallet_prompt_sends_people_to_the_app_instead_of_showing_the_address() {
+        let text = copy::wallet_ready();
+        assert!(text.contains("copy it or share it"));
+        assert!(!text.contains("<code>"));
+    }
+
+    #[test]
+    fn the_tenth_reads_back_the_split_and_escapes_the_mix_name() {
+        let rule = BotRule { percent: 10, mix_name: "Fun <&> picks".into() };
+        let text = copy::tenth(Some(&rule));
+        assert!(text.contains("10% of every payment") && text.contains("The other 90% stays yours"));
+        assert!(text.contains("Fun &lt;&amp;&gt; picks"));
+        assert!(copy::tenth(None).contains("not set your tenth yet"));
+        let odd = BotRule { percent: 150, mix_name: "x".into() };
+        assert!(copy::tenth(Some(&odd)).contains("The other 0% stays yours"), "never a negative share");
+    }
+
+    #[test]
+    fn an_empty_portfolio_talks_about_cash_only() {
+        let text = copy::portfolio(&portfolio(0, None));
+        assert!(text.contains("$12.50 ready to withdraw and nothing invested yet"));
+    }
+
+    #[test]
+    fn a_portfolio_with_holdings_says_up_down_or_nothing_about_the_gain() {
+        assert!(copy::portfolio(&portfolio(2, Some("20.00"))).contains("worth $300.00 today, up $20.00 since you started"));
+        assert!(copy::portfolio(&portfolio(2, Some("-5.25"))).contains("down $5.25 since you started"));
+        let flat = copy::portfolio(&portfolio(2, None));
+        assert!(!flat.contains("since you started") && flat.contains("$12.50 is ready to withdraw"));
+    }
+
+    fn deposit(default: &str, networks: &[(&str, &str)]) -> BotDeposit {
+        BotDeposit {
+            asset: "USDC".into(),
+            default_network: default.into(),
+            networks: networks
+                .iter()
+                .map(|(network, address)| bot_data::BotNetworkAddress { network: network.to_string(), address: address.to_string() })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn deposit_copy_names_the_asset_network_and_address_and_warns_about_mistakes() {
+        let text = copy::deposit(&deposit("solana", &[("evm", "0xabc"), ("solana", "SoL1")]));
+        assert!(text.contains("Send <b>USDC</b>") && text.contains("<b>solana</b>"));
+        assert!(text.contains("<code>SoL1</code>") && !text.contains("0xabc"));
+        assert!(text.contains("Any other asset or network can be lost for good"));
+        assert!(copy::deposit(&deposit("base", &[("solana", "SoL1")])).contains("Not available yet"), "no address for the default network");
+    }
+
+    #[test]
+    fn the_address_list_shows_every_network_or_says_it_is_unavailable() {
+        let text = copy::addresses(&deposit("solana", &[("evm", "0xabc"), ("solana", "SoL1")]));
+        assert!(text.contains("<code>0xabc</code>") && text.contains("<code>SoL1</code>"));
+        assert!(text.ends_with("Always check the network before you send."));
+        assert!(copy::addresses(&deposit("solana", &[])).contains("Not available yet"));
+    }
+
+    #[test]
+    fn the_sell_list_prices_what_it_can_and_escapes_names() {
+        let items = vec![
+            bot_data::BotSellable { asset_key: "a".into(), name: "A & B".into(), value: Some("10.00".into()) },
+            bot_data::BotSellable { asset_key: "b".into(), name: "Plain".into(), value: None },
+        ];
+        let text = copy::sell(&items);
+        assert!(text.contains("A &amp; B, worth about $10.00"));
+        assert!(text.lines().any(|l| l == "Plain"));
+        assert!(copy::sell_none().contains("Nothing to sell yet"));
+    }
+
+    #[test]
+    fn the_login_code_is_shown_in_a_copyable_block_with_a_warning() {
+        let text = copy::login_code("ABCD2345");
+        assert!(text.contains("<code>ABCD2345</code>") && text.contains("Never share this code"));
+    }
+
+    #[test]
+    fn every_onboarding_message_has_a_heading_and_no_stray_html() {
+        let all = [
+            copy::choose_percentage(),
+            copy::choose_plan(10),
+            copy::rule_saved(),
+            copy::gateway_pending(),
+            copy::kyc_needed(),
+            copy::kyc_pending(),
+            copy::kyc_review(),
+            copy::kyc_done(),
+            copy::wallet_pending(),
+            copy::wallet_ready(),
+            copy::unavailable(),
+            copy::buy(),
+            copy::withdraw(),
+        ];
+        for text in all {
+            assert!(text.starts_with("<b>") && text.contains("</b>"), "{text}");
+            assert_eq!(text.matches("<b>").count(), text.matches("</b>").count(), "{text}");
+            assert_eq!(text.matches("<blockquote>").count(), text.matches("</blockquote>").count(), "{text}");
+        }
+        assert!(copy::choose_plan(20).contains("You picked 20%"));
+    }
+
+    #[test]
+    fn updates_parse_from_telegrams_json_and_ignore_unknown_fields() {
+        let update: TelegramUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 5,
+            "message": { "message_id": 1, "date": 0, "chat": { "id": 9, "type": "private" },
+                         "from": { "id": 9, "is_bot": false, "first_name": "Ada", "username": "ada" }, "text": "/start" }
+        }))
+        .unwrap();
+        assert_eq!(update.update_id, 5);
+        let message = update.message.unwrap();
+        assert_eq!((message.chat.id, message.from.unwrap().username.as_deref(), message.text.as_deref()), (9, Some("ada"), Some("/start")));
+        assert!(update.callback_query.is_none());
     }
 }

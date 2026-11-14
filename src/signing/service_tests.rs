@@ -1,5 +1,5 @@
 use super::{
-    PolicyError,
+    IntentKind, PolicyError,
     test_support::{ACTIVITY, insert_user, limits, payload, payload_of_type, service},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -74,14 +74,14 @@ async fn intents_are_idempotent_per_order_and_size_checked(pool: PgPool) {
     let svc = service(&pool, limits(50, 100)).await;
     let user = insert_user(&pool).await;
 
-    let first = svc.create_buy_intent(user, "order-1", "10.50").await.unwrap();
-    let again = svc.create_buy_intent(user, "order-1", "10.50").await.unwrap();
+    let first = svc.create_intent(user, "order-1", IntentKind::Buy, "10.50").await.unwrap();
+    let again = svc.create_intent(user, "order-1", IntentKind::Buy, "10.50").await.unwrap();
     assert_eq!(first, again);
 
-    assert!(svc.create_buy_intent(user, "order-1", "11").await.is_err());
-    let too_big = svc.create_buy_intent(user, "order-2", "50.01").await.unwrap_err();
+    assert!(svc.create_intent(user, "order-1", IntentKind::Buy, "11").await.is_err());
+    let too_big = svc.create_intent(user, "order-2", IntentKind::Buy, "50.01").await.unwrap_err();
     assert_eq!(policy_error(&too_big), &PolicyError::OrderTooLarge);
-    assert!(svc.create_buy_intent(user, "order-3", "0").await.is_err());
+    assert!(svc.create_intent(user, "order-3", IntentKind::Buy, "0").await.is_err());
     assert_eq!(count(&pool, "SELECT count(*) FROM signing_intents").await, 1);
 }
 
@@ -90,7 +90,7 @@ async fn a_valid_intent_signs_exactly_once(pool: PgPool) {
     let svc = service(&pool, limits(50, 100)).await;
     let user = insert_user(&pool).await;
     let public_key = svc.ensure_user_key(user).await.unwrap();
-    let intent = svc.create_buy_intent(user, "order-1", "10").await.unwrap();
+    let intent = svc.create_intent(user, "order-1", IntentKind::Buy, "10").await.unwrap();
 
     let stamps = svc.sign_intent(intent, &[payload("a"), payload("b")]).await.unwrap();
     assert_eq!(stamps.len(), 2);
@@ -112,7 +112,7 @@ async fn concurrent_signing_of_one_intent_succeeds_once(pool: PgPool) {
     let svc = Arc::new(service(&pool, limits(50, 100)).await);
     let user = insert_user(&pool).await;
     svc.ensure_user_key(user).await.unwrap();
-    let intent = svc.create_buy_intent(user, "order-1", "10").await.unwrap();
+    let intent = svc.create_intent(user, "order-1", IntentKind::Buy, "10").await.unwrap();
 
     let mut tasks = JoinSet::new();
     for _ in 0..6 {
@@ -131,7 +131,7 @@ async fn expired_intents_are_rejected(pool: PgPool) {
     let svc = service(&pool, limits(50, 100)).await;
     let user = insert_user(&pool).await;
     svc.ensure_user_key(user).await.unwrap();
-    let intent = svc.create_buy_intent(user, "order-1", "10").await.unwrap();
+    let intent = svc.create_intent(user, "order-1", IntentKind::Buy, "10").await.unwrap();
     sqlx::query("UPDATE signing_intents SET expires_at = now() - interval '1 minute'")
         .execute(&pool)
         .await
@@ -149,15 +149,15 @@ async fn daily_limit_counts_signed_orders(pool: PgPool) {
     svc.ensure_user_key(user).await.unwrap();
 
     for order in ["o1", "o2"] {
-        let intent = svc.create_buy_intent(user, order, "40").await.unwrap();
+        let intent = svc.create_intent(user, order, IntentKind::Buy, "40").await.unwrap();
         svc.sign_intent(intent, &[payload(order)]).await.unwrap();
     }
-    let third = svc.create_buy_intent(user, "o3", "40").await.unwrap();
+    let third = svc.create_intent(user, "o3", IntentKind::Buy, "40").await.unwrap();
     let error = svc.sign_intent(third, &[payload("o3")]).await.unwrap_err();
     assert_eq!(policy_error(&error), &PolicyError::DailyLimitExceeded);
     assert_eq!(intent_status(&pool, third).await, "pending");
 
-    let small = svc.create_buy_intent(user, "o4", "20").await.unwrap();
+    let small = svc.create_intent(user, "o4", IntentKind::Buy, "20").await.unwrap();
     assert!(svc.sign_intent(small, &[payload("o4")]).await.is_ok());
 }
 
@@ -171,7 +171,7 @@ async fn daily_limit_holds_under_concurrency(pool: PgPool) {
     for order in ["a", "b", "c", "d"] {
         let svc = svc.clone();
         tasks.spawn(async move {
-            let intent = svc.create_buy_intent(user, order, "60").await.unwrap();
+            let intent = svc.create_intent(user, order, IntentKind::Buy, "60").await.unwrap();
             svc.sign_intent(intent, &[payload(order)]).await.is_ok()
         });
     }
@@ -189,7 +189,7 @@ async fn limits_are_per_user(pool: PgPool) {
     let bob = insert_user(&pool).await;
     for (user, order) in [(alice, "a"), (bob, "b")] {
         svc.ensure_user_key(user).await.unwrap();
-        let intent = svc.create_buy_intent(user, order, "50").await.unwrap();
+        let intent = svc.create_intent(user, order, IntentKind::Buy, "50").await.unwrap();
         assert!(svc.sign_intent(intent, &[payload(order)]).await.is_ok());
     }
 }
@@ -199,7 +199,7 @@ async fn revoked_keys_cannot_sign(pool: PgPool) {
     let svc = service(&pool, limits(50, 100)).await;
     let user = insert_user(&pool).await;
     svc.ensure_user_key(user).await.unwrap();
-    let intent = svc.create_buy_intent(user, "order-1", "10").await.unwrap();
+    let intent = svc.create_intent(user, "order-1", IntentKind::Buy, "10").await.unwrap();
     svc.revoke_user_key(user).await.unwrap();
 
     let error = svc.sign_intent(intent, &[payload("a")]).await.unwrap_err();
@@ -210,7 +210,7 @@ async fn revoked_keys_cannot_sign(pool: PgPool) {
 async fn users_without_a_key_cannot_sign(pool: PgPool) {
     let svc = service(&pool, limits(50, 100)).await;
     let user = insert_user(&pool).await;
-    let intent = svc.create_buy_intent(user, "order-1", "10").await.unwrap();
+    let intent = svc.create_intent(user, "order-1", IntentKind::Buy, "10").await.unwrap();
 
     let error = svc.sign_intent(intent, &[payload("a")]).await.unwrap_err();
     assert_eq!(policy_error(&error), &PolicyError::NoActiveKey);
@@ -221,7 +221,7 @@ async fn bad_payloads_are_rejected_and_leave_the_intent_usable(pool: PgPool) {
     let svc = service(&pool, limits(50, 100)).await;
     let user = insert_user(&pool).await;
     svc.ensure_user_key(user).await.unwrap();
-    let intent = svc.create_buy_intent(user, "order-1", "10").await.unwrap();
+    let intent = svc.create_intent(user, "order-1", IntentKind::Buy, "10").await.unwrap();
 
     let mut tampered = payload("a");
     tampered.payload.push(' ');
@@ -257,7 +257,7 @@ async fn a_key_moved_to_another_user_row_is_unusable(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
-    let intent = svc.create_buy_intent(alice, "order-1", "10").await.unwrap();
+    let intent = svc.create_intent(alice, "order-1", IntentKind::Buy, "10").await.unwrap();
 
     assert!(svc.sign_intent(intent, &[payload("a")]).await.is_err());
     assert_eq!(intent_status(&pool, intent).await, "pending");
@@ -276,7 +276,7 @@ async fn only_the_allowed_activity_is_signed(pool: PgPool) {
     let svc = service(&pool, limits(50, 100)).await;
     let user = insert_user(&pool).await;
     svc.ensure_user_key(user).await.unwrap();
-    let intent = svc.create_buy_intent(user, "order-1", "10").await.unwrap();
+    let intent = svc.create_intent(user, "order-1", IntentKind::Buy, "10").await.unwrap();
     assert!(svc.sign_intent(intent, &[payload_of_type(ACTIVITY, "a")]).await.is_ok());
 }
 
@@ -322,4 +322,80 @@ async fn an_order_cannot_switch_kind_or_amount(pool: PgPool) {
     assert_eq!(svc.create_intent(user, "o1", Sell, "20").await.unwrap(), first);
     assert!(svc.create_intent(user, "o1", Withdraw, "20").await.is_err(), "a sale cannot be re-used to authorize a withdrawal");
     assert!(svc.create_intent(user, "o1", Sell, "21").await.is_err());
+}
+
+async fn stamp_public_key(stamp: &str) -> String {
+    let json: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(stamp).unwrap()).unwrap();
+    json["publicKey"].as_str().unwrap().to_string()
+}
+
+#[sqlx::test]
+async fn every_payload_is_stamped_with_the_users_own_key(pool: PgPool) {
+    let svc = service(&pool, limits(50, 200)).await;
+    let (alice, bob) = (insert_user(&pool).await, insert_user(&pool).await);
+    let alice_key = svc.ensure_user_key(alice).await.unwrap();
+    let bob_key = svc.ensure_user_key(bob).await.unwrap();
+    assert_ne!(alice_key, bob_key, "every user has their own key");
+
+    let intent = svc.create_intent(alice, "order-1", IntentKind::Buy, "10").await.unwrap();
+    let stamps = svc.sign_intent(intent, &[payload("a"), payload("b")]).await.unwrap();
+    assert_eq!(stamps.len(), 2);
+    assert_ne!(stamps[0], stamps[1], "different payloads, different signatures");
+    for stamp in &stamps {
+        assert_eq!(stamp_public_key(stamp).await, alice_key);
+    }
+}
+
+#[sqlx::test]
+async fn keys_wrapped_before_a_rotation_keep_signing_and_new_keys_use_the_new_version(pool: PgPool) {
+    use super::{LocalKeyWrapper, SigningService};
+    let spec = |entries: &[(i32, u8)]| {
+        entries.iter().map(|(v, b)| format!("{v}:{}", hex::encode([*b; 32]))).collect::<Vec<_>>().join(",")
+    };
+    let old = SigningService::new(pool.clone(), LocalKeyWrapper::from_spec(&spec(&[(1, 7)]), 1).unwrap(), limits(50, 200));
+    let rotated = SigningService::new(pool.clone(), LocalKeyWrapper::from_spec(&spec(&[(1, 7), (2, 9)]), 2).unwrap(), limits(50, 200));
+
+    let early = insert_user(&pool).await;
+    let early_key = old.ensure_user_key(early).await.unwrap();
+    let late = insert_user(&pool).await;
+    rotated.ensure_user_key(late).await.unwrap();
+
+    let versions: Vec<(i32,)> = sqlx::query_as("SELECT key_version FROM signer_keys ORDER BY created_at").fetch_all(&pool).await.unwrap();
+    assert_eq!(versions, vec![(1,), (2,)]);
+
+    let intent = rotated.create_intent(early, "order-1", IntentKind::Buy, "10").await.unwrap();
+    let stamps = rotated.sign_intent(intent, &[payload("a")]).await.unwrap();
+    assert_eq!(stamp_public_key(&stamps[0]).await, early_key);
+    assert!(old.sign_intent(rotated.create_intent(late, "order-2", IntentKind::Buy, "10").await.unwrap(), &[payload("b")]).await.is_err(), "a service without the new master key cannot read it");
+}
+
+#[sqlx::test]
+async fn the_audit_trail_records_who_and_why(pool: PgPool) {
+    let svc = service(&pool, limits(50, 200)).await;
+    let user = insert_user(&pool).await;
+    svc.ensure_user_key(user).await.unwrap();
+    let ok = svc.create_intent(user, "o1", IntentKind::Buy, "10").await.unwrap();
+    svc.sign_intent(ok, &[payload("a")]).await.unwrap();
+    let bad = svc.create_intent(user, "o2", IntentKind::Buy, "10").await.unwrap();
+    svc.sign_intent(bad, &[payload_of_type("ACTIVITY_TYPE_EXPORT_SECRETS", "x")]).await.unwrap_err();
+
+    let rows: Vec<(Option<uuid::Uuid>, uuid::Uuid, String, Option<String>)> =
+        sqlx::query_as("SELECT user_id, intent_id, outcome, reason FROM signing_audit ORDER BY id").fetch_all(&pool).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].0, rows[0].1, rows[0].2.as_str(), rows[0].3.as_deref()), (Some(user), ok, "signed", None));
+    assert_eq!((rows[1].0, rows[1].1, rows[1].2.as_str()), (Some(user), bad, "rejected"));
+    assert!(rows[1].3.as_deref().unwrap().contains("forbidden"));
+}
+
+#[sqlx::test]
+async fn a_revoked_user_never_silently_gets_a_new_key(pool: PgPool) {
+    let svc = service(&pool, limits(50, 200)).await;
+    let user = insert_user(&pool).await;
+    svc.ensure_user_key(user).await.unwrap();
+    svc.revoke_user_key(user).await.unwrap();
+    svc.revoke_user_key(user).await.unwrap();
+    let revoked: i64 = count(&pool, "SELECT count(*) FROM signer_keys WHERE revoked_at IS NOT NULL").await;
+    assert_eq!(revoked, 1, "revoking twice is harmless");
+    assert!(svc.ensure_user_key(user).await.is_err(), "a revoked user never silently gets a new key");
+    assert_eq!(count(&pool, "SELECT count(*) FROM signer_keys").await, 1);
 }

@@ -317,8 +317,20 @@ async fn set_outcome(
 }
 
 fn notify_outcome(state: &ApplicationState, rec: &Record, status: &str, reason: Option<&str>) -> Result<()> {
+    if status == "verified" {
+        let web = |path: &str, text: &str| crate::services::bot::web_button(state, path, text);
+        notify::tell_user_all(
+            state,
+            rec.user_id,
+            vec![
+                ("<b>You are verified</b>\n\nYour tenth is now active.".into(), vec![]),
+                (crate::services::bot::copy::wallet_ready(), web("/add-funds", "Open my wallet")),
+                (crate::services::bot::copy::terms(), web("/terms", "Read terms and policies")),
+            ],
+        );
+        return Ok(());
+    }
     let text = match (status, reason) {
-        ("verified", _) => "<b>You are verified</b>\n\nYour tenth is now active. Send /deposit to add funds.".to_string(),
         ("review", _) => "<b>We are taking a closer look</b>\n\nYour details need a quick manual check. We will message you as soon as it is done.".to_string(),
         (_, Some("name_mismatch")) => "<b>We could not match your name</b>\n\nThe name you gave does not match your NIN record. Check it and try again.".to_string(),
         (_, Some("nin_not_found" | "nin_rejected")) => "<b>We could not find that NIN</b>\n\nCheck the 11 digits and try again.".to_string(),

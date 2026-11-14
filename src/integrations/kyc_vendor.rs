@@ -9,15 +9,6 @@ pub enum VendorConfig {
     Dojah { base_url: String, app_id: String, secret_key: String, nin_path: Option<String> },
 }
 
-impl VendorConfig {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Prembly { .. } => "prembly",
-            Self::Dojah { .. } => "dojah",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NinEntity {
     pub first_name: String,

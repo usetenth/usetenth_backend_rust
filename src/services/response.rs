@@ -20,48 +20,17 @@ impl<T: Serialize> ApiResponse<T> {
             }),
         )
     }
+}
 
-    pub fn internal_server_error() -> (StatusCode, Json<Self>) {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(Self {
-                success: false,
-                message: "Internal Server Error".into(),
-                data: None,
-            }),
-        )
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn not_found() -> (StatusCode, Json<Self>) {
-        (
-            StatusCode::NOT_FOUND,
-            Json(Self {
-                success: false,
-                message: "Resource not found".into(),
-                data: None,
-            }),
-        )
-    }
-
-    pub fn created() -> (StatusCode, Json<Self>) {
-        (
-            StatusCode::CREATED,
-            Json(Self {
-                success: false,
-                message: "Resource created".into(),
-                data: None,
-            }),
-        )
-    }
-
-    pub fn unauthorized() -> (StatusCode, Json<Self>) {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(Self {
-                success: false,
-                message: "Unauthorized".into(),
-                data: None,
-            }),
-        )
+    #[test]
+    fn ok_wraps_the_data_in_the_standard_envelope() {
+        let (status, body) = ApiResponse::ok("Done", vec![1, 2]);
+        assert_eq!(status, StatusCode::OK);
+        let json = serde_json::to_value(&body.0).unwrap();
+        assert_eq!(json, serde_json::json!({ "success": true, "message": "Done", "data": [1, 2] }));
     }
 }

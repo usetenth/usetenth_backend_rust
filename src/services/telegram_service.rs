@@ -48,6 +48,24 @@ impl TelegramService {
         Self::call(state, "sendMessage", &body).await
     }
 
+    // Sends a picture with an HTML caption (at most 1,024 characters) and the same buttons as `send_message`.
+    pub async fn send_photo(state: &ApplicationState, chat_id: i64, png: &'static [u8], caption: &str, buttons: &[Button]) -> Result<()> {
+        use reqwest::multipart::{Form, Part};
+        let photo = Part::bytes(png).file_name("usetenth.png").mime_str("image/png")?;
+        let mut form = Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("caption", caption.to_string())
+            .text("parse_mode", "HTML")
+            .part("photo", photo);
+        if !buttons.is_empty() {
+            let rows: Vec<Value> = buttons.iter().map(|b| json!([b.to_json()])).collect();
+            form = form.text("reply_markup", json!({ "inline_keyboard": rows }).to_string());
+        }
+        let url = format!("{}/bot{}/sendPhoto", state.config.telegram_api_base, state.config.telegram_bot_token);
+        let response = state.http.post(url).multipart(form).send().await.map_err(|e| e.without_url())?;
+        Self::reply("sendPhoto", response).await
+    }
+
     // Stops the loading spinner on a pressed inline button.
     pub async fn answer_callback_query(state: &ApplicationState, callback_query_id: &str) -> Result<()> {
         let body = json!({ "callback_query_id": callback_query_id });
@@ -64,6 +82,10 @@ impl TelegramService {
             .send()
             .await
             .map_err(|e| e.without_url())?;
+        Self::reply(method, response).await
+    }
+
+    async fn reply(method: &str, response: reqwest::Response) -> Result<()> {
         let status = response.status();
         let reply = response.json::<TelegramReply>().await.ok();
         match reply {
@@ -71,5 +93,21 @@ impl TelegramService {
             Some(r) => bail!("telegram {method} failed: {}", r.description.unwrap_or_default()),
             None => bail!("telegram {method} failed: HTTP {status}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_app_buttons_open_a_url() {
+        let button = Button::WebApp { text: "Open".into(), url: "https://app.example/x".into() };
+        assert_eq!(button.to_json(), json!({ "text": "Open", "web_app": { "url": "https://app.example/x" } }));
+    }
+
+    #[test]
+    fn callback_buttons_carry_their_data() {
+        assert_eq!(Button::callback("10%", "pct:10").to_json(), json!({ "text": "10%", "callback_data": "pct:10" }));
     }
 }

@@ -70,6 +70,7 @@ impl<W: KeyWrapper> SigningService<W> {
             .ok_or_else(|| PolicyError::NoActiveKey.into())
     }
 
+    #[allow(dead_code)] // Operator tooling will call this; tests cover it.
     pub async fn revoke_user_key(&self, user_id: Uuid) -> Result<()> {
         sqlx::query("UPDATE signer_keys SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL")
             .bind(user_id)
@@ -80,10 +81,6 @@ impl<W: KeyWrapper> SigningService<W> {
 
     pub fn limits(&self) -> &SigningLimits {
         &self.limits
-    }
-
-    pub async fn create_buy_intent(&self, user_id: Uuid, order_id: &str, amount_usd: &str) -> Result<Uuid> {
-        self.create_intent(user_id, order_id, IntentKind::Buy, amount_usd).await
     }
 
     /// Records an intent to sign `amount_usd` of `kind`; repeats return it, changing amount or kind is refused.

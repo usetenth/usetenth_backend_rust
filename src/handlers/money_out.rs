@@ -98,18 +98,17 @@ async fn plan_sell(state: &ApplicationState, gateway_id: &str, user_id: Uuid, bo
     Ok(SellPlan { qty, est_micros })
 }
 
-async fn settlement_asset(state: &ApplicationState) -> Result<String, AuthError> {
-    let key: Option<String> = sqlx::query_scalar("SELECT asset_key FROM assets WHERE stable AND upper(symbol) = ANY($1) LIMIT 1")
-        .bind(&state.config.engine.settlement_symbols)
-        .fetch_optional(&state.pool)
-        .await?;
+async fn settlement_asset(state: &ApplicationState, base_key: &str) -> Result<String, AuthError> {
+    let key = crate::services::catalog::quote_asset_for(&state.pool, base_key, &state.config.engine.settlement_symbols)
+        .await
+        .map_err(|e| AuthError::Internal(e))?;
     key.ok_or_else(|| AuthError::Conflict("Selling is not available right now".into()))
 }
 
 pub async fn sell_quote(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser, Json(body): Json<SellInput>) -> ApiResult<Value> {
     let gateway_id = active_gateway_user(&state, user_id).await?;
     let plan = plan_sell(&state, &gateway_id, user_id, &body).await?;
-    let quote_asset = settlement_asset(&state).await?;
+    let quote_asset = settlement_asset(&state, &body.asset_key).await?;
     let quote = state
         .tm_client
         .get_market_quote(
@@ -169,6 +168,7 @@ pub struct NewAddress {
     label: Option<String>,
     password: Option<String>,
     code: Option<String>,
+    confirmation_id: Option<Uuid>,
 }
 
 const MAX_ADDRESSES: i64 = 10;
@@ -183,7 +183,7 @@ pub async fn add_address(State(state): State<ApplicationState>, AuthUser(user_id
 
     let family = address::detect(&body.address);
     let canonical = address::validate(family, &body.address).map_err(|m| AuthError::BadRequest(m.into()))?;
-    step_up::confirm(&state, user_id, &step_up::add_address_purpose(&canonical), body.password.as_deref(), body.code.as_deref()).await?;
+    step_up::confirm(&state, user_id, &step_up::add_address_purpose(&canonical), body.password.as_deref(), body.code.as_deref(), body.confirmation_id).await?;
     let own: Vec<String> = sqlx::query_scalar("SELECT address FROM wallets WHERE user_id = $1").bind(user_id).fetch_all(&state.pool).await?;
     if own.iter().any(|a| address::same_address(family, a, &canonical)) {
         return Err(AuthError::BadRequest("That is your own deposit address".into()));
@@ -257,7 +257,7 @@ pub async fn remove_address(State(state): State<ApplicationState>, AuthUser(user
 
 pub async fn withdraw_assets(State(state): State<ApplicationState>, AuthUser(_): AuthUser) -> ApiResult<Vec<Value>> {
     let rows: Vec<(String, String, Option<String>)> =
-        sqlx::query_as("SELECT asset_key, symbol, chain FROM assets WHERE stable AND tradable AND upper(symbol) = ANY($1) ORDER BY symbol, chain")
+        sqlx::query_as(&format!("SELECT asset_key, symbol, chain FROM assets WHERE {} AND upper(symbol) = ANY($1) ORDER BY symbol, chain", crate::services::catalog::WITHDRAWABLE))
             .bind(&state.config.engine.settlement_symbols)
             .fetch_all(&state.pool)
             .await?;
@@ -279,6 +279,7 @@ pub struct WithdrawInput {
     amount_usd: String,
     password: Option<String>,
     code: Option<String>,
+    confirmation_id: Option<Uuid>,
     client_ref: Option<String>,
 }
 
@@ -318,7 +319,7 @@ pub async fn withdraw(State(state): State<ApplicationState>, AuthUser(user_id): 
     }
 
     let purpose = step_up::withdraw_purpose(body.address_id, &body.asset_key, micros, &reference);
-    step_up::confirm(&state, user_id, &purpose, body.password.as_deref(), body.code.as_deref()).await?;
+    step_up::confirm(&state, user_id, &purpose, body.password.as_deref(), body.code.as_deref(), body.confirmation_id).await?;
 
     let dest: Option<(String, String, DateTime<Utc>)> = sqlx::query_as(
         "SELECT address, chain_family, usable_at FROM withdrawal_addresses WHERE id = $1 AND user_id = $2 AND removed_at IS NULL",
@@ -333,7 +334,7 @@ pub async fn withdraw(State(state): State<ApplicationState>, AuthUser(user_id): 
     }
 
     let chain: Option<Option<String>> =
-        sqlx::query_scalar("SELECT chain FROM assets WHERE asset_key = $1 AND stable AND tradable AND upper(symbol) = ANY($2)")
+        sqlx::query_scalar(&format!("SELECT chain FROM assets WHERE asset_key = $1 AND {} AND upper(symbol) = ANY($2)", crate::services::catalog::WITHDRAWABLE))
             .bind(&body.asset_key)
             .bind(&state.config.engine.settlement_symbols)
             .fetch_optional(&state.pool)
@@ -467,7 +468,13 @@ pub async fn challenge(State(state): State<ApplicationState>, AuthUser(user_id):
             (step_up::withdraw_purpose(address_id, &asset_key, micros, &reference), summary)
         }
     };
-    let method = step_up::challenge(&state, user_id, &purpose, &summary).await?;
+    let (method, challenge_id) = step_up::challenge(&state, user_id, &purpose, &summary).await?;
     let expires_in = (method == step_up::Method::TelegramCode).then_some(step_up::CODE_TTL_SECS);
-    Ok(ApiResponse::ok("Confirmation", json!({ "method": method, "expires_in": expires_in })))
+    Ok(ApiResponse::ok("Confirmation", json!({ "method": method, "expires_in": expires_in, "challenge_id": challenge_id })))
+}
+
+/// Whether the Telegram request the user started has been approved yet; the app polls this.
+pub async fn confirmation_status(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser, Path(id): Path<Uuid>) -> ApiResult<Value> {
+    let (approved, live) = step_up::status(&state, user_id, id).await?;
+    Ok(ApiResponse::ok("Confirmation status", json!({ "approved": approved, "live": live })))
 }

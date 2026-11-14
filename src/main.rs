@@ -11,7 +11,6 @@ mod handlers;
 mod models;
 mod routes;
 mod services;
-#[allow(dead_code)]
 mod signing;
 mod utils;
 #[cfg(test)]
@@ -28,6 +27,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::from_env()?;
     let application_state = ApplicationState::new(config.clone()).await?;
+    if std::env::args().nth(1).as_deref() == Some("seed") {
+        return services::catalog::run_seed(&application_state).await;
+    }
     if config.engine.enabled {
         tokio::spawn(engine::worker::run(application_state.clone()));
     }

@@ -4,9 +4,9 @@ use super::auth::ApiResult;
 use super::mobile::validate_weights;
 use super::webhook::constant_time_eq;
 use crate::app_state::ApplicationState;
-use crate::integrations::types::{AssetClass, AssetStatus};
 use crate::models::schemas::InvestmentPlan;
 use crate::services::auth::AuthError;
+use crate::services::catalog;
 use crate::services::response::ApiResponse;
 use axum::{
     Json,
@@ -39,39 +39,9 @@ impl FromRequestParts<ApplicationState> for Admin {
     }
 }
 
-/// Copies the gateway's first page of assets into `assets`; tradable means active and tradeable.
+/// Copies the gateway's assets into `assets`; tradable means active and tradeable.
 pub async fn sync_assets(State(state): State<ApplicationState>, _: Admin) -> ApiResult<Value> {
-    let list = state.tm_client.get_asset_list().await.map_err(AuthError::Internal)?;
-    let (mut synced, mut tradable) = (0, 0);
-    for item in list.data {
-        let (Some(id), Some(symbol)) = (item.id, item.symbol.clone()) else { continue };
-        let is_tradable =
-            item.tradeable == Some(true) && item.status == Some(AssetStatus::Active) && item.is_active != Some(false);
-        let class = match item.asset_class {
-            Some(AssetClass::Stock) => "stock",
-            Some(AssetClass::Crypto) => "crypto",
-            None => "",
-        };
-        sqlx::query(
-            "INSERT INTO assets (asset_key, symbol, name, chain, address, asset_class, tradable, stable, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
-             ON CONFLICT (asset_key) DO UPDATE SET symbol = EXCLUDED.symbol, name = EXCLUDED.name, chain = EXCLUDED.chain,
-                 address = EXCLUDED.address, asset_class = EXCLUDED.asset_class, tradable = EXCLUDED.tradable,
-                 stable = EXCLUDED.stable, updated_at = now()",
-        )
-        .bind(id.to_string())
-        .bind(&symbol)
-        .bind(item.name.unwrap_or_else(|| symbol.clone()))
-        .bind(item.chain)
-        .bind(item.address)
-        .bind(class)
-        .bind(is_tradable)
-        .bind(item.stable.unwrap_or(false))
-        .execute(&state.pool)
-        .await?;
-        synced += 1;
-        tradable += is_tradable as usize;
-    }
+    let (synced, tradable) = catalog::sync_assets(&state).await.map_err(AuthError::Internal)?;
     Ok(ApiResponse::ok("Assets synced", json!({ "synced": synced, "tradable": tradable })))
 }
 

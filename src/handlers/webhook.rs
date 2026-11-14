@@ -25,8 +25,6 @@ pub async fn webhook_handler(
     )
 }
 
-pub async fn get_webhook_updates() {}
-
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -46,5 +44,19 @@ pub async fn telegram_auth_middleware(
         Ok(next.run(req).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn secrets_match_only_when_every_byte_does() {
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(!constant_time_eq(b"s3cret", b"s3creT"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cret!"), "different lengths never match");
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

@@ -49,7 +49,6 @@ pub struct AppConfig {
     pub true_market_key_file_path: Option<String>,
     // Only used (and required) in production mode.
     pub turnkey: Option<TurnkeyConfig>,
-    pub true_market_env_mode: AppMode,
     pub true_market_organization_id: String,
     // HS256 secret for mobile access tokens (at least 32 bytes).
     pub jwt_secret: String,
@@ -231,12 +230,6 @@ impl AppConfig {
                 }
                 _ => None,
             },
-            true_market_env_mode: match std::env::var("TM_ENV") {
-                Ok(mode) => mode.parse()?,
-                Err(_) => std::env::var("APP_MODE")
-                    .map_err(|_| anyhow::anyhow!("APP_MODE must be set"))?
-                    .parse()?,
-            },
             true_market_organization_id: std::env::var("TM_ORGANIZATION_ID")
                 .map_err(|_| anyhow::anyhow!("TM_ORGANIZATION_ID must be provided"))?,
             engine: EngineConfig::from_env()?,
@@ -284,7 +277,6 @@ impl AppConfig {
             true_market_base_url: true_market_base_url.into(),
             true_market_key_file_path: None,
             turnkey: None,
-            true_market_env_mode: AppMode::Development,
             true_market_organization_id: "org".into(),
             jwt_secret: "test-secret-test-secret-test-secret-1234".into(),
             access_token_ttl_secs: 900,
@@ -330,5 +322,33 @@ impl KycConfig {
             max_attempts: 3,
             retry_delay_secs: 30,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_mode_accepts_long_and_short_names_in_any_case() {
+        for (raw, mode) in [
+            ("production", AppMode::Production),
+            (" PROD ", AppMode::Production),
+            ("development", AppMode::Development),
+            ("Dev", AppMode::Development),
+        ] {
+            assert_eq!(raw.parse::<AppMode>().unwrap(), mode, "{raw}");
+        }
+        assert!("staging".parse::<AppMode>().is_err());
+        assert!("".parse::<AppMode>().is_err());
+    }
+
+    #[test]
+    fn the_test_config_is_a_safe_development_setup() {
+        let config = AppConfig::for_test("http://gateway.test", EngineConfig::for_test(true));
+        assert_eq!(config.app_mode, AppMode::Development);
+        assert!(config.engine.dry_run);
+        assert_eq!(config.kyc.mode, KycMode::Vendor);
+        assert_eq!(config.true_market_base_url, "http://gateway.test");
     }
 }

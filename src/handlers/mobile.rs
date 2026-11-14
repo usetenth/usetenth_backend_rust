@@ -206,16 +206,39 @@ pub async fn set_custom_picks(
 
 
 pub async fn list_assets(State(state): State<ApplicationState>, AuthUser(_): AuthUser) -> ApiResult<Vec<Value>> {
-    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT asset_key, symbol, name, asset_class FROM assets WHERE tradable AND NOT stable ORDER BY symbol",
-    )
-    .fetch_all(&state.pool)
-    .await?;
+    let rows = crate::services::catalog::listable(&state.pool).await.map_err(internal)?;
     let items = rows
         .into_iter()
         .map(|(asset_key, symbol, name, class)| json!({ "asset_key": asset_key, "symbol": symbol, "name": name, "asset_class": class }))
         .collect();
     Ok(ApiResponse::ok("Assets", items))
+}
+
+pub async fn notifications(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser) -> ApiResult<Value> {
+    let rows: Vec<(Uuid, String, String, String, DateTime<Utc>, bool)> = sqlx::query_as(
+        "SELECT id, kind, title, body, created_at, read_at IS NOT NULL FROM notifications
+         WHERE user_id = $1 ORDER BY created_at DESC LIMIT 30",
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let unread: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read_at IS NULL")
+        .bind(user_id)
+        .fetch_one(&state.pool)
+        .await?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, kind, title, body, created_at, read)| json!({ "id": id, "kind": kind, "title": title, "body": body, "created_at": created_at, "read": read }))
+        .collect();
+    Ok(ApiResponse::ok("Notifications", json!({ "unread": unread, "items": items })))
+}
+
+pub async fn notifications_read(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser) -> ApiResult<()> {
+    sqlx::query("UPDATE notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL")
+        .bind(user_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(ApiResponse::ok("Marked as read", ()))
 }
 
 pub async fn portfolio(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser) -> ApiResult<BotPortfolio> {
@@ -343,10 +366,7 @@ async fn checked_trade(state: &ApplicationState, body: &TradeInput) -> Result<i6
 pub async fn quote(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser, Json(body): Json<TradeInput>) -> ApiResult<Value> {
     let gateway_id = active_gateway_user(&state, user_id).await?;
     let micros = checked_trade(&state, &body).await?;
-    let settlement: Option<String> = sqlx::query_scalar("SELECT asset_key FROM assets WHERE stable AND upper(symbol) = ANY($1) LIMIT 1")
-        .bind(&state.config.engine.settlement_symbols)
-        .fetch_optional(&state.pool)
-        .await?;
+    let settlement = crate::services::catalog::quote_asset_for(&state.pool, &body.asset_key, &state.config.engine.settlement_symbols).await.map_err(internal)?;
     let quote_asset = settlement.ok_or_else(|| AuthError::Conflict("Buying is not available right now".into()))?;
     let quote = state
         .tm_client

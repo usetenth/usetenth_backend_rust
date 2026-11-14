@@ -53,15 +53,20 @@ pub fn decide(deposit_micros: i64, rule: &RuleInput, ctx: &Context) -> Decision 
         return Decision::Skip("below_minimum");
     }
 
-    // A leg under the floor is not worth an order; what is left is still invested.
-    let legs: Vec<(String, i64)> = split_bps(invest, ctx.allocations)
-        .into_iter()
-        .filter(|(_, micros)| *micros >= ctx.global_floor_micros && *micros > 0)
-        .collect();
-    if legs.is_empty() {
-        return Decision::Skip("below_minimum");
+    // A leg under the floor is not worth an order, so the smallest stock is dropped and the whole tenth is split again.
+    let mut weights: Vec<(String, i32)> = ctx.allocations.to_vec();
+    loop {
+        let legs = split_bps(invest, &weights);
+        if legs.iter().all(|(_, micros)| *micros >= ctx.global_floor_micros && *micros > 0) {
+            return Decision::Invest { invest_micros: invest, legs };
+        }
+        if weights.len() == 1 {
+            return Decision::Skip("below_minimum");
+        }
+        let smallest = (0..weights.len()).min_by(|a, b| weights[*a].1.cmp(&weights[*b].1).then_with(|| weights[*b].0.cmp(&weights[*a].0))).unwrap_or(0);
+        weights.remove(smallest);
+        weights = crate::services::catalog::normalize_bps(&weights);
     }
-    Decision::Invest { invest_micros: legs.iter().map(|(_, v)| v).sum(), legs }
 }
 
 #[cfg(test)]
@@ -143,13 +148,35 @@ mod tests {
     }
 
     #[test]
-    fn drops_legs_below_the_floor_and_reports_what_is_invested() {
+    fn a_leg_under_the_floor_is_folded_into_the_others_so_the_whole_tenth_is_invested() {
         let a = alloc(&[("spy", 9500), ("tiny", 500)]);
-        // 10 USD split 9.50 / 0.50: the 0.50 leg is under the 1 USD floor.
+        // 10 USD split 9.50 / 0.50: the 0.50 leg is under the 1 USD floor, so spy takes all 10.
         assert_eq!(
             decide(100_000_000, &rule(10), &ctx(&a)),
-            Decision::Invest { invest_micros: 9_500_000, legs: vec![("spy".into(), 9_500_000)] }
+            Decision::Invest { invest_micros: 10_000_000, legs: vec![("spy".into(), 10_000_000)] }
         );
+    }
+
+    #[test]
+    fn a_small_tenth_keeps_only_as_many_stocks_as_it_can_afford() {
+        let a = alloc(&[("nvda", 2500), ("amzn", 2000), ("tsla", 1500), ("meta", 1500), ("nflx", 1500), ("amd", 1000)]);
+        // 3.97 USD across six stocks would leave every leg under 1 USD; the two heaviest stocks remain.
+        let decision = decide(19_840_000, &rule(20), &ctx(&a));
+        let Decision::Invest { invest_micros, legs } = decision else { panic!("expected an investment") };
+        assert_eq!(invest_micros, 3_968_000);
+        assert_eq!(legs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec!["nvda", "amzn"]);
+        assert_eq!(legs.iter().map(|(_, v)| v).sum::<i64>(), 3_968_000);
+        assert!(legs.iter().all(|(_, v)| *v >= 1_000_000));
+    }
+
+    #[test]
+    fn folding_never_loses_a_cent() {
+        let a = alloc(&[("a", 3333), ("b", 3333), ("c", 3334)]);
+        for deposit in [10_000_000, 12_345_678, 29_999_999, 100_000_001] {
+            if let Decision::Invest { invest_micros, legs } = decide(deposit, &rule(10), &ctx(&a)) {
+                assert_eq!(legs.iter().map(|(_, v)| v).sum::<i64>(), invest_micros, "{deposit}");
+            }
+        }
     }
 
     #[test]

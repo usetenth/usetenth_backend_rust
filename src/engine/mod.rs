@@ -11,3 +11,6 @@ pub(crate) mod worker_tests;
 
 #[cfg(test)]
 mod money_out_tests;
+
+#[cfg(test)]
+mod notify_tests;

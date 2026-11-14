@@ -1,3 +1,6 @@
+// Mirrors the gateway API; not every field or call is used yet.
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

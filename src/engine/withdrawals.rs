@@ -104,7 +104,7 @@ async fn process(state: &ApplicationState, w: Row) -> anyhow::Result<()> {
     if removed || !usable {
         return fail("destination is no longer available".into()).await;
     }
-    let chain: Option<String> = sqlx::query_scalar("SELECT chain FROM assets WHERE asset_key = $1 AND stable AND tradable")
+    let chain: Option<String> = sqlx::query_scalar(&format!("SELECT chain FROM assets WHERE asset_key = $1 AND {}", crate::services::catalog::WITHDRAWABLE))
         .bind(&w.asset_key)
         .fetch_optional(pool)
         .await?
@@ -272,32 +272,28 @@ pub async fn reconcile(state: &ApplicationState) -> anyhow::Result<()> {
 
 pub async fn notify(state: &ApplicationState) -> anyhow::Result<()> {
     let pool = &state.pool;
-    sqlx::query(
-        "UPDATE withdrawals w SET notified_at = now() FROM users u
-         WHERE u.id = w.user_id AND w.notified_at IS NULL
-           AND (w.status = 'dry_run' OR u.telegram_id IS NULL) AND w.status IN ('completed', 'failed', 'dry_run')",
-    )
-    .execute(pool)
-    .await?;
-    let due: Vec<(Uuid, i64, String, i64)> = sqlx::query_as(
-        "SELECT w.id, u.telegram_id, w.status, w.amount_micros FROM withdrawals w JOIN users u ON u.id = w.user_id
-         WHERE w.notified_at IS NULL AND u.telegram_id IS NOT NULL AND w.status IN ('completed', 'failed') LIMIT 50",
+    sqlx::query("UPDATE withdrawals SET notified_at = now() WHERE notified_at IS NULL AND status = 'dry_run'").execute(pool).await?;
+    let due: Vec<(Uuid, Uuid, Option<i64>, String, i64)> = sqlx::query_as(
+        "SELECT w.id, w.user_id, u.telegram_id, w.status, w.amount_micros FROM withdrawals w JOIN users u ON u.id = w.user_id
+         WHERE w.notified_at IS NULL AND w.status IN ('completed', 'failed') LIMIT 50",
     )
     .fetch_all(pool)
     .await?;
-    for (id, chat_id, status, micros) in due {
+    for (id, user_id, chat, status, micros) in due {
         let amount = usd(&format_micros(micros));
-        let text = if status == "completed" {
-            format!("<b>Withdrawal sent</b>\n\n{amount} is on its way to your saved address.")
+        let (title, body) = if status == "completed" {
+            ("Withdrawal sent", format!("{amount} is on its way to your saved address."))
         } else {
-            format!("<b>Withdrawal not sent</b>\n\nYour {amount} withdrawal did not go through. Nothing left your account.")
+            ("Withdrawal not sent", format!("Your {amount} withdrawal did not go through. Nothing left your account."))
         };
-        match TelegramService::send_message(state, chat_id, &text, &[]).await {
-            Ok(()) => {
-                sqlx::query("UPDATE withdrawals SET notified_at = now() WHERE id = $1").bind(id).execute(pool).await?;
+        crate::services::notify::record(pool, user_id, "withdrawal", id, title, &body).await?;
+        if let Some(chat_id) = chat {
+            if let Err(error) = TelegramService::send_message(state, chat_id, &format!("<b>{title}</b>\n\n{body}"), &[]).await {
+                eprintln!("Could not notify about withdrawal {id}: {error:#}");
+                continue;
             }
-            Err(error) => eprintln!("Could not notify about withdrawal {id}: {error:#}"),
         }
+        sqlx::query("UPDATE withdrawals SET notified_at = now() WHERE id = $1").bind(id).execute(pool).await?;
     }
     Ok(())
 }

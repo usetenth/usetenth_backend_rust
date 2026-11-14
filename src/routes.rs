@@ -3,14 +3,14 @@ use reqwest::StatusCode;
 use crate::{
     app_state::ApplicationState,
     handlers::{admin, auth, mobile, money_out},
-    handlers::webhook::{get_webhook_updates, telegram_auth_middleware, webhook_handler},
+    handlers::webhook::{telegram_auth_middleware, webhook_handler},
 };
 use crate::services::response::ApiResponse;
 
 pub fn app_router(state: ApplicationState) -> Router {
     // Only the webhook requires Telegram's secret token; / and /health stay public.
     let webhook = Router::new()
-        .route("/webhook", get(get_webhook_updates).post(webhook_handler))
+        .route("/webhook", post(webhook_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             telegram_auth_middleware,
@@ -37,6 +37,8 @@ pub fn app_router(state: ApplicationState) -> Router {
         .route("/assets", get(mobile::list_assets))
         .route("/portfolio", get(mobile::portfolio))
         .route("/deposit", get(mobile::deposit))
+        .route("/notifications", get(mobile::notifications))
+        .route("/notifications/read", post(mobile::notifications_read))
         .route("/investments", get(mobile::list_investments))
         .route("/trades/quote", post(mobile::quote))
         .route("/trades", post(mobile::buy))
@@ -46,6 +48,7 @@ pub fn app_router(state: ApplicationState) -> Router {
         .route("/sells/quote", post(money_out::sell_quote))
         .route("/sells", post(money_out::sell))
         .route("/confirm", post(money_out::challenge))
+        .route("/confirm/{id}", get(money_out::confirmation_status))
         .route("/withdraw/assets", get(money_out::withdraw_assets))
         .route("/withdraw/addresses", get(money_out::list_addresses).post(money_out::add_address))
         .route("/withdraw/addresses/{id}", delete(money_out::remove_address))

@@ -137,21 +137,6 @@ pub fn parse_usd_micros(value: &str) -> Result<i64, PolicyError> {
     Ok(micros)
 }
 
-pub fn check_order_size(limits: &SigningLimits, amount_micros: i64) -> Result<(), PolicyError> {
-    if amount_micros > limits.max_order_micros {
-        return Err(PolicyError::OrderTooLarge);
-    }
-    Ok(())
-}
-
-pub fn check_amount(
-    limits: &SigningLimits,
-    amount_micros: i64,
-    signed_last_day_micros: i64,
-) -> Result<(), PolicyError> {
-    check_amount_for(IntentKind::Buy, limits, amount_micros, signed_last_day_micros)
-}
-
 pub fn check_amount_for(
     kind: IntentKind,
     limits: &SigningLimits,
@@ -243,13 +228,13 @@ mod tests {
     #[test]
     fn enforces_order_and_daily_limits() {
         let l = limits(&[]);
-        assert!(check_amount(&l, 50 * MICROS_PER_USD, 50 * MICROS_PER_USD).is_ok());
-        assert_eq!(check_amount(&l, 51 * MICROS_PER_USD, 0), Err(PolicyError::OrderTooLarge));
+        assert!(check_amount_for(IntentKind::Buy, &l, 50 * MICROS_PER_USD, 50 * MICROS_PER_USD).is_ok());
+        assert_eq!(check_amount_for(IntentKind::Buy, &l, 51 * MICROS_PER_USD, 0), Err(PolicyError::OrderTooLarge));
         assert_eq!(
-            check_amount(&l, MICROS_PER_USD, 100 * MICROS_PER_USD),
+            check_amount_for(IntentKind::Buy, &l, MICROS_PER_USD, 100 * MICROS_PER_USD),
             Err(PolicyError::DailyLimitExceeded)
         );
-        assert_eq!(check_amount(&l, 1, i64::MAX), Err(PolicyError::DailyLimitExceeded));
+        assert_eq!(check_amount_for(IntentKind::Buy, &l, 1, i64::MAX), Err(PolicyError::DailyLimitExceeded));
     }
 
     #[test]

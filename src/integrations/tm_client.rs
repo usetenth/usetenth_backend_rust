@@ -17,12 +17,20 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+/// Accepts the host, the host plus /v1, or the full gateway address, and returns (host, gateway address).
+fn split_base_url(raw: &str) -> (String, String) {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let origin = trimmed.strip_suffix("/v1/gateway").or_else(|| trimmed.strip_suffix("/v1")).unwrap_or(trimmed);
+    (origin.to_string(), format!("{origin}/v1/gateway"))
+}
+
 #[derive(Debug, Clone)]
 struct CachedToken {
     value: String,
     refreshed_at: chrono::DateTime<Utc>,
 }
 
+#[allow(dead_code)] // Mirrors the gateway API; not every call is used yet.
 pub struct TrueMarketClient {
     http: reqwest::Client,
     base_url: String,
@@ -33,6 +41,7 @@ pub struct TrueMarketClient {
     retry_duration: u16,
 }
 
+#[allow(dead_code)] // Mirrors the gateway API; not every call is used yet.
 impl TrueMarketClient {
     pub async fn new(config: AppConfig, retry_duration: u16) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
@@ -42,12 +51,7 @@ impl TrueMarketClient {
 
         let api_key = super::key_source::load_api_key(&config).await?;
 
-        let base_url = config
-            .true_market_base_url
-            .trim_end_matches('/')
-            .to_string();
-        // Configure this separately for UAT vs production if Accounts API has a different host.
-        let origin = base_url.strip_suffix("/v1/gateway").unwrap_or(&base_url);
+        let (origin, base_url) = split_base_url(&config.true_market_base_url);
         let account_base_url = format!("{origin}/v1/account");
 
         Ok(Self {
@@ -280,7 +284,8 @@ impl TrueMarketClient {
     }
 
     pub async fn get_asset_list(&self) -> anyhow::Result<ListAssetsResponse> {
-        self.get("assets", None).await
+        // The gateway lists crypto only unless stocks are asked for.
+        self.get("assets?asset_class=crypto,stock", None).await
     }
 
     pub async fn get_asset(&self, chain: &str, address: &str) -> anyhow::Result<AssetItem> {
@@ -472,5 +477,117 @@ impl TrueMarketClient {
     // Available for observability/config validation; this is not a transaction retry policy.
     pub fn configured_retry_duration(&self) -> u16 {
         self.retry_duration
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, extract::State, http::HeaderMap, routing::{get, post}};
+    use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+
+    #[test]
+    fn every_accepted_base_url_form_gives_the_same_addresses() {
+        for raw in [
+            "https://api.truemarkets.co",
+            "https://api.truemarkets.co/",
+            "https://api.truemarkets.co/v1",
+            "https://api.truemarkets.co/v1/",
+            " https://api.truemarkets.co/v1/gateway/ ",
+        ] {
+            assert_eq!(
+                split_base_url(raw),
+                ("https://api.truemarkets.co".to_string(), "https://api.truemarkets.co/v1/gateway".to_string()),
+                "{raw}"
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Gateway {
+        mints: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+        reject_first_call: Arc<std::sync::atomic::AtomicBool>,
+        seen: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    }
+
+    async fn serve(gateway: Gateway) -> String {
+        async fn token(State(g): State<Gateway>) -> Json<Value> {
+            let n = g.mints.fetch_add(1, Ordering::SeqCst) + 1;
+            Json(json!({ "access_token": format!("token-{n}") }))
+        }
+        async fn portfolio(State(g): State<Gateway>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
+            let n = g.calls.fetch_add(1, Ordering::SeqCst);
+            let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+            let on_behalf = headers.get("tm-on-behalf-of").and_then(|v| v.to_str().ok()).map(String::from);
+            g.seen.lock().unwrap().push((auth, on_behalf));
+            if n == 0 && g.reject_first_call.load(Ordering::SeqCst) {
+                return (StatusCode::UNAUTHORIZED, Json(json!({})));
+            }
+            (StatusCode::OK, Json(json!({ "balances": [], "positions": [] })))
+        }
+        async fn broken() -> (StatusCode, &'static str) {
+            (StatusCode::INTERNAL_SERVER_ERROR, "boom")
+        }
+        async fn empty() -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+        async fn garbage() -> &'static str {
+            "{\"unexpected\": true"
+        }
+        let app = Router::new()
+            .route("/v1/auth/api-key/token", post(token))
+            .route("/v1/gateway/portfolio", get(portfolio))
+            .route("/v1/gateway/broken", get(broken))
+            .route("/v1/gateway/empty", get(empty))
+            .route("/v1/gateway/garbage", get(garbage))
+            .with_state(gateway);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/v1/gateway")
+    }
+
+    #[tokio::test]
+    async fn the_token_is_minted_once_and_reused_with_the_user_header() {
+        let gateway = Gateway::default();
+        let client = TrueMarketClient::for_test(&serve(gateway.clone()).await);
+        client.get_portfolio("gw-user").await.unwrap();
+        client.get_portfolio("gw-user").await.unwrap();
+
+        assert_eq!(gateway.mints.load(Ordering::SeqCst), 1);
+        let seen = gateway.seen.lock().unwrap();
+        assert_eq!(seen[0], ("Bearer token-1".to_string(), Some("gw-user".to_string())));
+        assert_eq!(seen[1].0, "Bearer token-1");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_replaced_and_the_call_retried_once() {
+        let gateway = Gateway::default();
+        gateway.reject_first_call.store(true, Ordering::SeqCst);
+        let client = TrueMarketClient::for_test(&serve(gateway.clone()).await);
+        client.get_portfolio("gw-user").await.unwrap();
+
+        assert_eq!(gateway.mints.load(Ordering::SeqCst), 2, "a fresh token was minted after the 401");
+        let seen = gateway.seen.lock().unwrap();
+        assert_eq!(seen[0].0, "Bearer token-1");
+        assert_eq!(seen[1].0, "Bearer token-2");
+    }
+
+    #[tokio::test]
+    async fn failures_carry_the_status_and_body() {
+        let client = TrueMarketClient::for_test(&serve(Gateway::default()).await);
+        let error = client.get::<Value>("broken", None).await.unwrap_err().to_string();
+        assert!(error.contains("500") && error.contains("boom"), "{error}");
+        let error = client.get::<Value>("garbage", None).await.unwrap_err().to_string();
+        assert!(error.contains("decode"), "{error}");
+        let error = client.get::<Value>("empty", None).await.unwrap_err().to_string();
+        assert!(error.contains("204"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_gateway_is_an_error_not_a_panic() {
+        let client = TrueMarketClient::for_test("http://127.0.0.1:1/v1/gateway");
+        assert!(client.get_portfolio("gw-user").await.is_err());
     }
 }

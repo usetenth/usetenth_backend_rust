@@ -151,3 +151,79 @@ fn stamp(body: &str, api_public_key_hex: &str, api_private_key_hex: &str) -> Res
     });
     Ok(URL_SAFE_NO_PAD.encode(stamp.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p256::ecdsa::{VerifyingKey, signature::Verifier};
+    use rand::rngs::OsRng;
+    use serde_json::Value;
+    use uuid::Uuid;
+
+    fn temp_key_file(contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("usetenth-test-key-{}.json", Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_key_file_is_parsed_and_errors_name_the_problem() {
+        let secret = SigningKey::random(&mut OsRng);
+        let json = format!(
+            r#"{{"key_id":"k","label":"l","fingerprint":"f","created_at":"2026-01-01T00:00:00Z",
+                "private_key":{{"kty":"EC","crv":"P-256","x":"","y":"","d":"{}"}}}}"#,
+            URL_SAFE_NO_PAD.encode(secret.to_bytes())
+        );
+        let path = temp_key_file(&json);
+        let key = load_from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(key.key_id, "k");
+        assert!(key.signing_key().is_ok());
+
+        std::fs::write(&path, "not json").unwrap();
+        let error = load_from_file(path.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("not the expected JSON"));
+        std::fs::remove_file(&path).unwrap();
+
+        let error = load_from_file(path.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("Failed to read"));
+    }
+
+    #[tokio::test]
+    async fn production_never_falls_back_to_a_key_file() {
+        let mut config = AppConfig::for_test("http://gateway.test", crate::config::EngineConfig::for_test(true));
+        config.app_mode = AppMode::Production;
+        config.true_market_key_file_path = Some("/definitely/not/used".into());
+        let error = load_api_key(&config).await.unwrap_err();
+        assert!(error.to_string().contains("requires TURNKEY_"));
+    }
+
+    #[tokio::test]
+    async fn development_needs_a_key_file_path() {
+        let config = AppConfig::for_test("http://gateway.test", crate::config::EngineConfig::for_test(true));
+        let error = load_api_key(&config).await.unwrap_err();
+        assert!(error.to_string().contains("TM_KEY_FILE"));
+    }
+
+    #[test]
+    fn the_turnkey_stamp_signs_the_exact_body() {
+        let secret = SigningKey::random(&mut OsRng);
+        let public = hex::encode(secret.verifying_key().to_encoded_point(true).as_bytes());
+        let body = r#"{"type":"ACTIVITY_TYPE_EXPORT_SECRETS"}"#;
+        let stamped = stamp(body, &public, &hex::encode(secret.to_bytes())).unwrap();
+
+        let json: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(stamped).unwrap()).unwrap();
+        assert_eq!(json["publicKey"], public.as_str());
+        assert_eq!(json["scheme"], "SIGNATURE_SCHEME_TK_API_P256");
+        let der = hex::decode(json["signature"].as_str().unwrap()).unwrap();
+        let signature = Signature::from_der(&der).unwrap();
+        let verifier = VerifyingKey::from(&secret);
+        assert!(verifier.verify(body.as_bytes(), &signature).is_ok());
+        assert!(verifier.verify(b"{}", &signature).is_err());
+    }
+
+    #[test]
+    fn a_malformed_turnkey_private_key_is_rejected() {
+        assert!(stamp("{}", "pub", "zz").is_err(), "not hex");
+        assert!(stamp("{}", "pub", &hex::encode([0u8; 32])).is_err(), "zero scalar");
+    }
+}

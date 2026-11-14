@@ -10,4 +10,4 @@ pub mod test_support;
 
 pub use policy::{IntentKind, PolicyError, SigningLimits};
 pub use service::{SigningPayload, SigningService};
-pub use wrap::{KeyWrapper, LocalKeyWrapper, WrappedKey};
+pub use wrap::LocalKeyWrapper;

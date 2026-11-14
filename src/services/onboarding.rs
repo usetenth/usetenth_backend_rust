@@ -197,4 +197,41 @@ mod tests {
         assert_eq!(parse_plan("steady"), Some(InvestmentPlan::Steady));
         assert_eq!(parse_plan("custom"), None);
     }
+
+    fn row(has_rule: bool, gateway: Option<&str>, verified: VerificationStatus) -> Row {
+        Row { id: Uuid::nil(), verified, gateway_user_id: gateway.map(String::from), has_rule }
+    }
+
+    #[test]
+    fn the_stage_follows_the_first_missing_step() {
+        use VerificationStatus::*;
+        assert_eq!(stage_from(&row(false, None, Unverified)), Stage::NeedsRule);
+        assert_eq!(stage_from(&row(false, Some("gw"), Verified)), Stage::NeedsRule, "the rule always comes first");
+        assert_eq!(stage_from(&row(true, None, Unverified)), Stage::NeedsGateway);
+        assert_eq!(stage_from(&row(true, Some("gw"), Unverified)), Stage::NeedsKyc);
+        assert_eq!(stage_from(&row(true, Some("gw"), Review)), Stage::NeedsKyc, "review is not verified");
+        assert_eq!(stage_from(&row(true, Some("gw"), Verified)), Stage::Active);
+    }
+
+    #[test]
+    fn stages_serialize_in_snake_case() {
+        assert_eq!(serde_json::to_string(&Stage::NeedsKyc).unwrap(), "\"needs_kyc\"");
+        assert_eq!(serde_json::to_string(&Stage::NeedsGateway).unwrap(), "\"needs_gateway\"");
+    }
+
+    #[test]
+    fn every_offered_percentage_parses_and_nothing_else() {
+        for p in PERCENTAGES {
+            assert_eq!(parse_percentage(&p.to_string()), Some(p));
+        }
+        assert_eq!(parse_percentage(""), None);
+        assert_eq!(parse_percentage("10.5"), None);
+    }
+
+    #[test]
+    fn plan_names_are_case_sensitive_and_never_include_custom() {
+        assert_eq!(parse_plan("growth"), Some(InvestmentPlan::Growth));
+        assert_eq!(parse_plan("tech"), Some(InvestmentPlan::Tech));
+        assert_eq!(parse_plan("Steady"), None);
+    }
 }
