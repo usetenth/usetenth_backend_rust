@@ -43,6 +43,9 @@ pub(crate) struct Mock {
     pub(crate) nin_name: Arc<Mutex<(String, String, String)>>,
     pub(crate) assets_query: Arc<Mutex<String>>,
     pub(crate) photo_down: Arc<AtomicBool>,
+    pub(crate) transactions: Arc<Mutex<Vec<Value>>>,
+    pub(crate) defi_quotes: Arc<Mutex<Vec<Value>>>,
+    pub(crate) orders_without_quote: Arc<AtomicBool>,
 }
 
 impl Mock {
@@ -71,6 +74,9 @@ impl Mock {
             nin_name: Arc::new(Mutex::new(("Adaeze".into(), "".into(), "Obi".into()))),
             assets_query: Default::default(),
             photo_down: Default::default(),
+            transactions: Default::default(),
+            defi_quotes: Default::default(),
+            orders_without_quote: Default::default(),
         }
     }
     pub(crate) fn creates(&self) -> usize {
@@ -118,7 +124,8 @@ async fn serve(mock: Mock) -> String {
             return Json(json!({ "order_id": order_id, "status": "pending", "payloads": [] }));
         }
         let p = test_support::payload(&format!("order-{n}"));
-        Json(json!({ "order_id": order_id, "status": "initialized", "payloads": [{ "digest": p.digest, "payload": p.payload }] }))
+        let quote = if m.orders_without_quote.load(Ordering::SeqCst) { Value::Null } else { json!({ "qty": "10", "qty_out": "0.03", "fee": "0.01", "fee_asset": "USDC", "issues": [] }) };
+        Json(json!({ "order_id": order_id, "status": "initialized", "payloads": [{ "digest": p.digest, "payload": p.payload }], "quote": quote }))
     }
     async fn execute(State(m): State<Mock>, Path(_id): Path<String>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
         m.executes.fetch_add(1, Ordering::SeqCst);
@@ -248,6 +255,20 @@ async fn serve(mock: Mock) -> String {
             item("aaaaaaaa-0000-4000-8000-000000000005", "BTC", "Bitcoin", "crypto", None, true),
         ] }))
     }
+    async fn transactions(State(m): State<Mock>) -> Json<Value> {
+        Json(json!({ "data": *m.transactions.lock().unwrap() }))
+    }
+    async fn defi_quote(State(m): State<Mock>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+        m.defi_quotes.lock().unwrap().push(body.clone());
+        if body["base_asset"] == "0xNOAUTH" {
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "type": "unauthenticated", "message": "unauthorized" })));
+        }
+        if body["base_asset"] == "0xUNSUPPORTED" {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "type": "invalid_argument", "message": "unsupported asset" })));
+        }
+        let out = if body["order_side"] == "sell" { "249.50" } else { "0.025" };
+        (StatusCode::OK, Json(json!({ "quote_id": "q1", "qty": body["qty"], "qty_out": out, "fee": "0.02", "fee_asset": "USDC" })))
+    }
     async fn quote(Json(_): Json<Value>) -> Json<Value> {
         Json(json!({ "qty": "1", "price": "500", "notional": "500", "fee": "0.5" }))
     }
@@ -263,7 +284,9 @@ async fn serve(mock: Mock) -> String {
         .route("/v1/gateway/balances", get(balances))
         .route("/v1/gateway/portfolio", get(portfolio))
         .route("/v1/gateway/quotes", post(quote))
+        .route("/v1/defi/core/quote", post(defi_quote))
         .route("/v1/gateway/assets", get(assets))
+        .route("/v1/gateway/transactions", get(transactions))
         .route("/telegram/{bot}/sendMessage", post(send_message))
         .route("/telegram/{bot}/sendPhoto", post(send_photo))
         .route("/verification/vnin-basic", post(prembly_nin))
@@ -273,6 +296,18 @@ async fn serve(mock: Mock) -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{addr}/v1/gateway")
+}
+
+/// A completed incoming transfer of `amount` of `symbol`, as the gateway lists it.
+pub(crate) fn received(symbol: &str, amount: &str) -> Value {
+    let id = Uuid::new_v4().to_string();
+    json!({
+        "id": id, "type": "received_transfer", "status": "completed",
+        "received_transfer": {
+            "id": id, "chain": "solana", "tx_hash": format!("hash-{id}"), "from_address": "from", "to_address": "to",
+            "token_address": "token", "token_symbol": symbol, "amount": amount, "observed_at": "2026-11-14T10:00:00Z"
+        }
+    })
 }
 
 pub(crate) async fn state(pool: &PgPool, mock: &Mock, dry_run: bool) -> ApplicationState {

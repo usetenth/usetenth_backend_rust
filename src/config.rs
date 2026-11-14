@@ -70,7 +70,8 @@ pub struct EngineConfig {
     pub settlement_symbols: Vec<String>,
     // Investments and order legs below this are not worth placing.
     pub global_floor_micros: i64,
-    pub max_order_micros: i64,
+    // Largest manual buy; unset means no cap.
+    pub max_order_micros: Option<i64>,
     pub max_user_daily_micros: Option<i64>,
     // Gateway execute `auth_type`; no default, and live trading refuses to start without it.
     pub execute_auth_type: Option<String>,
@@ -107,10 +108,9 @@ impl KycConfig {
             "auto" => KycMode::Auto,
             other => anyhow::bail!("KYC_MODE must be 'vendor' or 'auto', got '{other}'"),
         };
-        anyhow::ensure!(
-            mode == KycMode::Vendor || *app_mode == AppMode::Development,
-            "KYC_MODE=auto approves everyone and is only allowed with APP_MODE=development"
-        );
+        if mode == KycMode::Auto && *app_mode == AppMode::Production {
+            eprintln!("WARNING: KYC_MODE=auto approves every user without any identity check, and APP_MODE is production");
+        }
 
         let mut config = Self {
             mode,
@@ -173,7 +173,10 @@ impl EngineConfig {
                 .filter(|s| !s.is_empty())
                 .collect(),
             global_floor_micros: usd_env("GLOBAL_FLOOR_USD", "1")?,
-            max_order_micros: usd_env("MAX_ORDER_USD", "50")?,
+            max_order_micros: match std::env::var("MAX_ORDER_USD").ok().filter(|v| !v.trim().is_empty()) {
+                Some(_) => Some(usd_env("MAX_ORDER_USD", "0")?),
+                None => None,
+            },
             max_user_daily_micros: match std::env::var("MAX_USER_SPEND_USD").ok().filter(|v| !v.trim().is_empty()) {
                 Some(_) => Some(usd_env("MAX_USER_SPEND_USD", "0")?),
                 None => None,
@@ -297,7 +300,7 @@ impl EngineConfig {
             poll_secs: 1,
             settlement_symbols: vec!["USDC".into()],
             global_floor_micros: 1_000_000,
-            max_order_micros: 50_000_000,
+            max_order_micros: Some(50_000_000),
             max_user_daily_micros: None,
             execute_auth_type: Some("test_auth".into()),
             withdraw_address_cooldown_secs: 86_400,

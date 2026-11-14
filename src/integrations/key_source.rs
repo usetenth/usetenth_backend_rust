@@ -55,12 +55,26 @@ struct ActivityResult {
 struct ExportSecretsResult {
     secret_payloads: Vec<String>,
 }
-// Enclave -> client message (`ServerSendMsg`); field names follow Turnkey's SDK, so verify against a live response.
-#[derive(Deserialize)]
+// Enclave -> client message (`ServerSendMsg`).
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerSendMsg {
     encapped_public: String,
     ciphertext: String,
+}
+
+/// Turnkey wraps the message in a signed bundle: {"version", "data": <hex of the message>, "dataSignature", "enclaveQuorumPublic"}.
+/// The bare message is accepted too. The ciphertext is authenticated when it is opened, and the reply came over TLS from a request we signed.
+fn parse_export_payload(payload: &str) -> Result<ServerSendMsg> {
+    let value: serde_json::Value = serde_json::from_str(payload).context("Turnkey secret payload is not JSON")?;
+    let message = match value.get("data").and_then(|d| d.as_str()) {
+        Some(hex_data) => {
+            let bytes = hex::decode(hex_data).context("Turnkey bundle data is not hex")?;
+            serde_json::from_slice(&bytes).context("Turnkey bundle data is not the expected message")?
+        }
+        None => serde_json::from_value(value).context("Unexpected Turnkey secret payload format")?,
+    };
+    Ok(message)
 }
 
 async fn load_from_turnkey(tk: &TurnkeyConfig) -> Result<TrueMarketApiKey> {
@@ -114,8 +128,7 @@ async fn load_from_turnkey(tk: &TurnkeyConfig) -> Result<TrueMarketApiKey> {
         .and_then(|r| r.secret_payloads.into_iter().next())
         .context("Turnkey response contained no secret payload")?;
 
-    let msg: ServerSendMsg =
-        serde_json::from_str(&payload).context("Unexpected Turnkey secret payload format")?;
+    let msg = parse_export_payload(&payload)?;
     let encapped = hex::decode(&msg.encapped_public)?;
     let ciphertext = hex::decode(&msg.ciphertext)?;
 
@@ -225,5 +238,27 @@ mod tests {
     fn a_malformed_turnkey_private_key_is_rejected() {
         assert!(stamp("{}", "pub", "zz").is_err(), "not hex");
         assert!(stamp("{}", "pub", &hex::encode([0u8; 32])).is_err(), "zero scalar");
+    }
+
+    #[test]
+    fn a_signed_export_bundle_is_unwrapped() {
+        let inner = r#"{"encappedPublic":"04ab","ciphertext":"cd01","organizationId":"org"}"#;
+        let bundle = format!(r#"{{"version":"v1.0.0","data":"{}","dataSignature":"sig","enclaveQuorumPublic":"04ff"}}"#, hex::encode(inner));
+        let msg = parse_export_payload(&bundle).unwrap();
+        assert_eq!((msg.encapped_public.as_str(), msg.ciphertext.as_str()), ("04ab", "cd01"));
+    }
+
+    #[test]
+    fn a_bare_message_is_still_accepted() {
+        let msg = parse_export_payload(r#"{"encappedPublic":"04ab","ciphertext":"cd01"}"#).unwrap();
+        assert_eq!(msg.encapped_public, "04ab");
+    }
+
+    #[test]
+    fn malformed_payloads_say_what_is_wrong() {
+        assert!(parse_export_payload("nope").unwrap_err().to_string().contains("not JSON"));
+        assert!(parse_export_payload(r#"{"data":"zz"}"#).unwrap_err().to_string().contains("not hex"));
+        assert!(parse_export_payload(&format!(r#"{{"data":"{}"}}"#, hex::encode("{}"))).unwrap_err().to_string().contains("expected message"));
+        assert!(parse_export_payload(r#"{"other":1}"#).is_err());
     }
 }

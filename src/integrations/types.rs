@@ -193,6 +193,24 @@ pub struct QuoteRequest {
     pub side: OrderSide,
 }
 
+/// Prices a tokenized stock on its own chain; `base_asset` is the token's contract address.
+#[derive(Debug, Clone, Serialize)]
+pub struct DefiQuoteRequest {
+    pub chain: String,
+    pub base_asset: String,
+    pub order_side: OrderSide,
+    pub qty: String,
+    pub qty_unit: QuantityUnit,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DefiQuoteResponse {
+    /// What the user receives: tokens for a buy, stablecoin for a sell.
+    pub qty_out: Option<String>,
+    pub fee: Option<String>,
+    pub issues: Option<Vec<Value>>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateOrderRequest {
     pub asset_id: String,

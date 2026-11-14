@@ -4,7 +4,33 @@ use crate::models::schemas::InvestmentPlan;
 use anyhow::Result;
 
 // Stablecoins are never "tradable" at the gateway, so withdrawals are judged by stable plus a network the wallets use.
-pub const WITHDRAWABLE: &str = "stable AND chain = ANY(ARRAY['solana', 'base'])";
+pub const WITHDRAWABLE: &str = "stable AND chain = ANY(ARRAY['solana', 'base', 'arbitrum', 'robinhood'])";
+
+/// The networks each kind of wallet address works on.
+pub fn chains_of(network: &str) -> &'static [&'static str] {
+    match network {
+        "solana" => &["solana"],
+        _ => &["base", "arbitrum", "robinhood"],
+    }
+}
+
+/// Every stablecoin symbol the gateway lists, so a payment in any of them counts as a deposit.
+pub async fn stable_symbols(pool: &sqlx::PgPool) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT DISTINCT upper(symbol) FROM assets WHERE stable ORDER BY 1").fetch_all(pool).await?)
+}
+
+/// The stablecoins that can be sent to a wallet address on `network`, the preferred ones first.
+pub async fn deposit_assets(pool: &sqlx::PgPool, network: &str, preferred: &[String]) -> Result<Vec<String>> {
+    let chains: Vec<String> = chains_of(network).iter().map(|c| c.to_string()).collect();
+    Ok(sqlx::query_scalar(
+        "SELECT upper(symbol) FROM assets WHERE stable AND chain = ANY($1)
+         GROUP BY upper(symbol) ORDER BY COALESCE(array_position($2, upper(symbol)), 99), 1",
+    )
+    .bind(&chains)
+    .bind(preferred)
+    .fetch_all(pool)
+    .await?)
+}
 
 // (ticker, weight in basis points); tickers True Markets does not list are skipped and the rest are scaled to 100%.
 const STEADY: &[(&str, i32)] = &[("AAPL", 2000), ("MSFT", 2000), ("GOOGL", 1500), ("AMZN", 1500), ("JNJ", 1000), ("KO", 1000), ("V", 1000)];
@@ -70,15 +96,17 @@ pub async fn listable(pool: &sqlx::PgPool) -> Result<Vec<(String, String, String
     .await?)
 }
 
-/// The settlement stablecoin on the same network as `base_key`, falling back to the exchange one.
-pub async fn quote_asset_for(pool: &sqlx::PgPool, base_key: &str, symbols: &[String]) -> Result<Option<String>> {
+/// The stablecoin on the same network as `base_key` (USDG on Robinhood Chain, for one), falling back to the exchange one.
+/// `preferred` breaks ties, so USDC wins where a network has several.
+pub async fn quote_asset_for(pool: &sqlx::PgPool, base_key: &str, preferred: &[String]) -> Result<Option<String>> {
     Ok(sqlx::query_scalar(
-        "SELECT q.asset_key FROM assets b JOIN assets q ON q.stable AND upper(q.symbol) = ANY($2)
+        "SELECT q.asset_key FROM assets b JOIN assets q ON q.stable
          WHERE b.asset_key = $1
-         ORDER BY (q.chain IS NOT DISTINCT FROM b.chain) DESC, (q.chain IS NULL) DESC, q.asset_key LIMIT 1",
+         ORDER BY (q.chain IS NOT DISTINCT FROM b.chain) DESC, COALESCE(array_position($2, upper(q.symbol)), 99),
+                  (q.chain IS NULL) DESC, q.asset_key LIMIT 1",
     )
     .bind(base_key)
-    .bind(symbols)
+    .bind(preferred)
     .fetch_optional(pool)
     .await?)
 }

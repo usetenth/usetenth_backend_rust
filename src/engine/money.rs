@@ -55,6 +55,17 @@ pub fn cmp_decimal(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     Some(x.checked_mul(10i128.checked_pow(scale - sx)?)?.cmp(&y.checked_mul(10i128.checked_pow(scale - sy)?)?))
 }
 
+/// USD per token, from a dollar amount and a token quantity, as a decimal string; None when the quantity is zero or unreadable.
+pub fn unit_price(usd: &str, tokens: &str) -> Option<String> {
+    let micros = parse_micros(usd)?;
+    let (n, scale) = parse_decimal(tokens)?;
+    if n == 0 {
+        return None;
+    }
+    let price = (micros as i128).checked_mul(10i128.checked_pow(scale)?)? / n;
+    Some(format_micros(i64::try_from(price).ok()?))
+}
+
 pub fn percent_of(micros: i64, percent: i16) -> i64 {
     (micros as i128 * percent as i128 / 100) as i64
 }
@@ -137,5 +148,14 @@ mod tests {
             assert!(legs.iter().all(|(_, v)| *v >= 0));
         }
         assert_eq!(split_bps(100, &weights)[0].0, "c");
+    }
+
+    #[test]
+    fn the_price_per_token_is_the_dollars_divided_by_the_tokens() {
+        assert_eq!(unit_price("10", "0.025").as_deref(), Some("400.00"));
+        assert_eq!(unit_price("1.00", "0.003045398400").as_deref(), Some("328.364262"));
+        assert_eq!(unit_price("5", "2").as_deref(), Some("2.50"));
+        assert_eq!(unit_price("5", "0"), None);
+        assert_eq!(unit_price("x", "1"), None);
     }
 }

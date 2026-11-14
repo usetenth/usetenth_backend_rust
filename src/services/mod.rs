@@ -11,6 +11,7 @@ pub mod step_up;
 pub mod cards;
 pub mod catalog;
 pub mod name_match;
+pub mod quotes;
 pub mod notify;
 
 #[cfg(test)]

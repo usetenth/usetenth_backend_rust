@@ -2,7 +2,7 @@ use super::auth::{JWTToken, MintTokenRequest, TrueMarketApiKey};
 use crate::config::AppConfig;
 use crate::integrations::types::{
     AssetItem, CancelOrderResponse, CreateGatewayUserRequest, CreateOrderResponse,
-    CreateRampResponse, ExecuteOrderResponse, ExecuteRequest, GatewayUserResponse,
+    CreateRampResponse, DefiQuoteRequest, DefiQuoteResponse, ExecuteOrderResponse, ExecuteRequest, GatewayUserResponse,
     GetOrderStatusResponse, GetOrdersResponse, ListAssetsResponse, ListBalancesResponse,
     ListPositionsResponse, ListTransactionsResponse, ListTransfersResponse, ModifyOrderResponse,
     OrderDetail, PortfolioResponse, QuoteRequest, QuoteResponse, RampDetail, RampRequest,
@@ -298,6 +298,12 @@ impl TrueMarketClient {
         request: &QuoteRequest,
     ) -> anyhow::Result<QuoteResponse> {
         self.post("quotes", Some(user_id), request).await
+    }
+
+    /// Quotes a tokenized stock through the DeFi API, which prices by chain and contract address.
+    pub async fn defi_quote(&self, user_id: &str, request: &DefiQuoteRequest) -> anyhow::Result<DefiQuoteResponse> {
+        let origin = self.base_url.strip_suffix("/v1/gateway").unwrap_or(&self.base_url).to_string();
+        self.request(Method::POST, &format!("{origin}/v1/defi/core"), "quote", Some(user_id), Some(request)).await
     }
 
     pub async fn get_user_balance(&self, user_id: &str) -> anyhow::Result<ListBalancesResponse> {

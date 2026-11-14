@@ -155,7 +155,7 @@ While developing, set `NGROK_AUTH_TOKEN` and `NGROK_DOMAIN` and the server opens
 | `DRY_RUN` | Leave `true` until you really want to trade. `false` also needs `TM_EXECUTE_AUTH_TYPE`. |
 | `SIGNING_MASTER_KEYS` | The master key that locks users' keys, written as `version:64 hex characters`. |
 | `SIGNING_ALLOWED_ACTIVITY_TYPES` | The only kinds of action the signer may approve. Left empty, it refuses everything, so set it before trading for real. |
-| `KYC_MODE` | `vendor` checks every NIN with the vendor. `auto` approves everyone and only works in development. |
+| `KYC_MODE` | `vendor` checks every NIN with the vendor. `auto` approves everyone with no check, so use it only for demos and testing. The server prints a warning when it runs in production. |
 | `ADMIN_API_KEY` | At least 16 characters, or the operator routes stay off. |
 
 Every setting, with its default, is listed in [.env.example](.env.example).

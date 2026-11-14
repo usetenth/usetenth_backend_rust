@@ -303,3 +303,27 @@ async fn withdrawals_and_investments_are_listed_in_the_app_once(pool: PgPool) {
     assert!(rows.iter().any(|(t, b)| t == "Your tenth is invested" && b.contains("$4.00")));
     assert_eq!(texts(&mock).len(), 3, "and Telegram still hears about each one");
 }
+
+// ---- Which payments count ----
+
+#[sqlx::test]
+async fn a_payment_in_any_stablecoin_counts_as_a_deposit_and_other_tokens_do_not(pool: PgPool) {
+    for (key, symbol, chain) in [("usdc", "USDC", "solana"), ("pyusd", "PYUSD", "solana"), ("usdg", "USDG", "robinhood")] {
+        sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, tradable, stable) VALUES ($1, $2, $2, $3, false, true)").bind(key).bind(symbol).bind(chain).execute(&pool).await.unwrap();
+    }
+    let mock = Mock::new("complete");
+    *mock.transactions.lock().unwrap() = vec![
+        crate::engine::worker_tests::received("USDC", "10"),
+        crate::engine::worker_tests::received("pyusd", "5.5"),
+        crate::engine::worker_tests::received("USDG", "3"),
+        crate::engine::worker_tests::received("SHIB", "999"),
+    ];
+    let st = state(&pool, &mock, true).await;
+    seed_user(&pool).await;
+
+    detect_deposits(&st).await.unwrap();
+    detect_deposits(&st).await.unwrap();
+
+    let rows: Vec<(String, i64)> = sqlx::query_as("SELECT asset, amount_micros FROM deposits ORDER BY asset").fetch_all(&pool).await.unwrap();
+    assert_eq!(rows, vec![("PYUSD".to_string(), 5_500_000), ("USDC".to_string(), 10_000_000), ("USDG".to_string(), 3_000_000)]);
+}

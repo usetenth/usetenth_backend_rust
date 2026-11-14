@@ -778,8 +778,13 @@ async fn a_quote_is_priced_in_the_stablecoin_on_the_stocks_own_network(pool: PgP
     assert_eq!(quote("stock-base").await.as_deref(), Some("usdc-base"));
     assert_eq!(quote("stock-sol").await.as_deref(), Some("usdc-sol"));
     assert_eq!(quote("stock-cefi").await.as_deref(), Some("usdc-cefi"));
-    assert_eq!(quote("stock-rh").await.as_deref(), Some("usdc-cefi"), "a network with no USDC falls back to the exchange one");
+    assert_eq!(quote("stock-rh").await.as_deref(), Some("usdc-cefi"), "a network with no stablecoin falls back to the exchange one");
     assert_eq!(quote("missing").await, None);
+
+    sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, tradable, stable) VALUES ('usdg-rh', 'USDG', 'Global Dollar', 'robinhood', false, true)").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, tradable, stable) VALUES ('pyusd-sol', 'PYUSD', 'PayPal USD', 'solana', false, true)").execute(&pool).await.unwrap();
+    assert_eq!(quote("stock-rh").await.as_deref(), Some("usdg-rh"), "Robinhood Chain stocks are priced in the stablecoin on that chain");
+    assert_eq!(quote("stock-sol").await.as_deref(), Some("usdc-sol"), "USDC wins where a network has several");
 }
 
 // ---- Picture cards ----
@@ -900,7 +905,11 @@ async fn stablecoins_can_be_withdrawn_even_though_the_gateway_marks_them_not_tra
         .map(|a| (a["chain"].as_str().unwrap().to_string(), a["chain_family"].as_str().unwrap().to_string()))
         .collect();
     chains.sort();
-    assert_eq!(chains, vec![("base".to_string(), "evm".to_string()), ("solana".to_string(), "solana".to_string())], "only the networks the wallets use");
+    assert_eq!(
+        chains,
+        vec![("arbitrum".to_string(), "evm".to_string()), ("base".to_string(), "evm".to_string()), ("solana".to_string(), "solana".to_string())],
+        "the networks the wallets use, never the exchange or Hypercore"
+    );
 }
 
 // ---- Approving in Telegram ----
@@ -962,4 +971,97 @@ async fn a_password_user_is_never_asked_to_approve_in_telegram(pool: PgPool) {
     let (method, id) = step_up::challenge(&st, user, "p", "x").await.unwrap();
     assert_eq!((method, id), (step_up::Method::Password, None));
     assert!(sent(&mock).is_empty());
+}
+
+// ---- Manual buy size ----
+
+async fn buy_status(base: &str, token: &str, amount: &str, reference: &str) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/trades"))
+        .bearer_auth(token)
+        .json(&json!({ "asset_key": "spy-id", "amount_usd": amount, "client_ref": reference }))
+        .send()
+        .await
+        .unwrap();
+    (response.status().as_u16(), response.json().await.unwrap())
+}
+
+#[sqlx::test]
+async fn manual_buys_have_no_ceiling_unless_one_is_configured(pool: PgPool) {
+    crate::engine::worker_tests::seed_assets(&pool).await;
+    let mock = Mock::new("complete");
+    let user = seed_user(&pool).await;
+
+    let mut capped = app_state(&pool, &mock).await;
+    capped.config.engine.max_order_micros = Some(50_000_000);
+    let token = auth::access_token_for_tests(&capped, user).await;
+    let base = serve_router(capped).await;
+    let (status, body) = buy_status(&base, &token, "100", "a").await;
+    assert_eq!(status, 400);
+    assert_eq!(body["message"], "Amount must be between $1.00 and $50.00");
+
+    let mut open = app_state(&pool, &mock).await;
+    open.config.engine.max_order_micros = None;
+    let base = serve_router(open).await;
+    assert_eq!(buy_status(&base, &token, "100", "b").await.0, 200, "no cap means any amount above the minimum");
+    let (status, body) = buy_status(&base, &token, "0.50", "c").await;
+    assert_eq!(status, 400);
+    assert_eq!(body["message"], "Amount must be at least $1.00");
+}
+
+#[sqlx::test]
+async fn each_wallet_network_lists_the_stablecoins_it_accepts(pool: PgPool) {
+    for (key, symbol, chain) in [("a", "USDC", "solana"), ("b", "PYUSD", "solana"), ("c", "USDC", "base"), ("d", "USDG", "robinhood"), ("e", "USDC", "hypercore-spot")] {
+        sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, tradable, stable) VALUES ($1, $2, $2, $3, false, true)").bind(key).bind(symbol).bind(chain).execute(&pool).await.unwrap();
+    }
+    let preferred = vec!["USDC".to_string()];
+    assert_eq!(crate::services::catalog::deposit_assets(&pool, "solana", &preferred).await.unwrap(), vec!["USDC", "PYUSD"]);
+    assert_eq!(crate::services::catalog::deposit_assets(&pool, "evm", &preferred).await.unwrap(), vec!["USDC", "USDG"]);
+}
+
+// ---- Quotes for tokenized stocks ----
+
+#[sqlx::test]
+async fn a_tokenized_stock_is_quoted_by_chain_and_contract_address(pool: PgPool) {
+    let mock = Mock::new("complete");
+    let st = app_state(&pool, &mock).await;
+    let user = seed_user(&pool).await;
+    sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, address, tradable, stable, asset_class) VALUES ('tok', 'MSFTC', 'Microsoft', 'base', '0xTOKEN', true, false, 'stock')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, address, tradable, stable, asset_class) VALUES ('bad', 'BAD', 'Bad', 'base', '0xUNSUPPORTED', true, false, 'stock')").execute(&pool).await.unwrap();
+    let token = auth::access_token_for_tests(&st, user).await;
+    let base = serve_router(st).await;
+    let client = reqwest::Client::new();
+
+    let body: Value = client.post(format!("{base}/v1/trades/quote")).bearer_auth(&token).json(&json!({ "asset_key": "tok", "amount_usd": "10" })).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["data"]["qty"], "0.025");
+    assert_eq!(body["data"]["price"], "400.00", "10 dollars for 0.025 tokens");
+    assert_eq!(body["data"]["fee"], "0.02");
+    assert_eq!(mock.defi_quotes.lock().unwrap()[0], json!({ "chain": "base", "base_asset": "0xTOKEN", "order_side": "buy", "qty": "10.00", "qty_unit": "quote" }));
+
+    sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, address, tradable, stable, asset_class) VALUES ('noauth', 'NOA', 'Noauth', 'base', '0xNOAUTH', true, false, 'stock')").execute(&pool).await.unwrap();
+    let via_order: Value = client.post(format!("{base}/v1/trades/quote")).bearer_auth(&token).json(&json!({ "asset_key": "noauth", "amount_usd": "10" })).send().await.unwrap().json().await.unwrap();
+    assert_eq!(via_order["data"]["qty"], "0.03", "when the DeFi quote is refused the order's own quote is used");
+    assert_eq!(via_order["data"]["price"], "333.333333");
+    assert_eq!(mock.last_order.lock().unwrap()["asset_id"], "noauth");
+
+    mock.orders_without_quote.store(true, std::sync::atomic::Ordering::SeqCst);
+    let refused = client.post(format!("{base}/v1/trades/quote")).bearer_auth(&token).json(&json!({ "asset_key": "bad", "amount_usd": "10" })).send().await.unwrap();
+    assert_eq!(refused.status(), 409);
+    let message: Value = refused.json().await.unwrap();
+    assert!(message["message"].as_str().unwrap().contains("unsupported asset"), "in development the gateway's reason is shown: {message}");
+}
+
+#[sqlx::test]
+async fn a_sale_is_quoted_in_tokens_and_paid_in_stablecoin(pool: PgPool) {
+    let mock = Mock::new("complete");
+    let st = app_state(&pool, &mock).await;
+    let user = seed_user(&pool).await;
+    sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, address, tradable, stable, asset_class) VALUES ($1, 'SPY', 'SPY', 'base', '0xSPY', true, false, 'stock')").bind(SPY).execute(&pool).await.unwrap();
+    let token = auth::access_token_for_tests(&st, user).await;
+    let base = serve_router(st).await;
+
+    let body: Value = reqwest::Client::new().post(format!("{base}/v1/sells/quote")).bearer_auth(&token).json(&json!({ "asset_key": SPY, "qty": "0.5" })).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["data"]["proceeds"], "249.50");
+    assert_eq!(body["data"]["price"], "499.00", "249.50 for half a token");
+    assert_eq!(mock.defi_quotes.lock().unwrap()[0], json!({ "chain": "base", "base_asset": "0xSPY", "order_side": "sell", "qty": "0.5", "qty_unit": "base" }));
 }

@@ -4,7 +4,6 @@ use super::mobile::{active_gateway_user, order_json, public_status};
 use crate::app_state::ApplicationState;
 use crate::engine::address;
 use crate::engine::money::{cmp_decimal, format_micros, mul_to_micros, parse_decimal, parse_micros};
-use crate::integrations::types::{OrderSide, QuantityUnit, QuoteRequest};
 use crate::services::auth::AuthError;
 use crate::services::holdings::{self, Holding};
 use crate::services::notify;
@@ -98,28 +97,16 @@ async fn plan_sell(state: &ApplicationState, gateway_id: &str, user_id: Uuid, bo
     Ok(SellPlan { qty, est_micros })
 }
 
-async fn settlement_asset(state: &ApplicationState, base_key: &str) -> Result<String, AuthError> {
-    let key = crate::services::catalog::quote_asset_for(&state.pool, base_key, &state.config.engine.settlement_symbols)
-        .await
-        .map_err(|e| AuthError::Internal(e))?;
-    key.ok_or_else(|| AuthError::Conflict("Selling is not available right now".into()))
-}
-
 pub async fn sell_quote(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser, Json(body): Json<SellInput>) -> ApiResult<Value> {
     let gateway_id = active_gateway_user(&state, user_id).await?;
     let plan = plan_sell(&state, &gateway_id, user_id, &body).await?;
-    let quote_asset = settlement_asset(&state, &body.asset_key).await?;
-    let quote = state
-        .tm_client
-        .get_market_quote(
-            &gateway_id,
-            &QuoteRequest { base_asset: body.asset_key.clone(), quote_asset, qty: plan.qty.clone(), qty_unit: QuantityUnit::Base, side: OrderSide::Sell },
-        )
-        .await
-        .map_err(|error| {
-            eprintln!("Sell quote failed for {user_id}: {error:#}");
-            AuthError::Conflict("We could not get a quote. Please try again.".into())
-        })?;
+    if !state.limiter.allow(&format!("quote:{user_id}"), 30, std::time::Duration::from_secs(60)) {
+        return Err(AuthError::TooManyRequests);
+    }
+    let quote = crate::services::quotes::sell(&state, &gateway_id, &body.asset_key, &plan.qty).await.map_err(|error| {
+        eprintln!("Sell quote failed for {user_id}: {error:#}");
+        super::mobile::quote_failed(&state, &error)
+    })?;
     Ok(ApiResponse::ok(
         "Quote",
         json!({ "qty": plan.qty, "estimated_usd": format_micros(plan.est_micros), "proceeds": quote.notional.or(quote.qty), "price": quote.price, "fee": quote.fee }),
@@ -255,10 +242,20 @@ pub async fn remove_address(State(state): State<ApplicationState>, AuthUser(user
 }
 
 
-pub async fn withdraw_assets(State(state): State<ApplicationState>, AuthUser(_): AuthUser) -> ApiResult<Vec<Value>> {
+pub async fn withdraw_assets(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser) -> ApiResult<Vec<Value>> {
+    // What the user holds of each, so the app can pick the stablecoin that actually has money in it.
+    let mut available = std::collections::HashMap::new();
+    if let Ok(gateway_id) = active_gateway_user(&state, user_id).await {
+        if let Ok(balances) = state.tm_client.get_user_balance(&gateway_id).await {
+            for b in balances.data {
+                if let (Some(id), Some(amount)) = (b.asset_id, b.available) {
+                    available.insert(id.to_lowercase(), amount);
+                }
+            }
+        }
+    }
     let rows: Vec<(String, String, Option<String>)> =
-        sqlx::query_as(&format!("SELECT asset_key, symbol, chain FROM assets WHERE {} AND upper(symbol) = ANY($1) ORDER BY symbol, chain", crate::services::catalog::WITHDRAWABLE))
-            .bind(&state.config.engine.settlement_symbols)
+        sqlx::query_as(&format!("SELECT asset_key, symbol, chain FROM assets WHERE {} ORDER BY symbol, chain", crate::services::catalog::WITHDRAWABLE))
             .fetch_all(&state.pool)
             .await?;
     Ok(ApiResponse::ok(
@@ -266,7 +263,8 @@ pub async fn withdraw_assets(State(state): State<ApplicationState>, AuthUser(_):
         rows.into_iter()
             .map(|(key, symbol, chain)| {
                 let family = address::family_of_chain(chain.as_deref().unwrap_or(""));
-                json!({ "asset_key": key, "symbol": symbol, "chain": chain, "chain_family": family.as_str() })
+                let held = available.get(&key.to_lowercase()).cloned();
+                json!({ "asset_key": key, "symbol": symbol, "chain": chain, "chain_family": family.as_str(), "available": held })
             })
             .collect(),
     ))
@@ -334,9 +332,8 @@ pub async fn withdraw(State(state): State<ApplicationState>, AuthUser(user_id): 
     }
 
     let chain: Option<Option<String>> =
-        sqlx::query_scalar(&format!("SELECT chain FROM assets WHERE asset_key = $1 AND {} AND upper(symbol) = ANY($2)", crate::services::catalog::WITHDRAWABLE))
+        sqlx::query_scalar(&format!("SELECT chain FROM assets WHERE asset_key = $1 AND {}", crate::services::catalog::WITHDRAWABLE))
             .bind(&body.asset_key)
-            .bind(&state.config.engine.settlement_symbols)
             .fetch_optional(&state.pool)
             .await?;
     let chain = chain.ok_or_else(|| AuthError::BadRequest("That asset cannot be withdrawn".into()))?.unwrap_or_default();

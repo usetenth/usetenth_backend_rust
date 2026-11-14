@@ -1,7 +1,6 @@
 use super::auth::{ApiResult, AuthUser};
 use crate::app_state::ApplicationState;
 use crate::engine::money::{format_micros, parse_micros};
-use crate::integrations::types::{OrderSide, QuantityUnit, QuoteRequest};
 use crate::models::schemas::InvestmentPlan;
 use crate::services::auth::AuthError;
 use crate::services::bot_data::{self, BotDeposit, BotPortfolio};
@@ -343,15 +342,25 @@ pub struct TradeInput {
     client_ref: Option<String>,
 }
 
+/// The message for a failed quote; in development it carries the gateway's reason, which users never see in production.
+pub(crate) fn quote_failed(state: &ApplicationState, error: &anyhow::Error) -> AuthError {
+    let detail = if state.config.app_mode == crate::config::AppMode::Development {
+        let text = format!("{error:#}");
+        format!(" Details: {}", text.chars().take(300).collect::<String>())
+    } else {
+        String::new()
+    };
+    AuthError::Conflict(format!("We could not get a quote. Please try again.{detail}"))
+}
+
 async fn checked_trade(state: &ApplicationState, body: &TradeInput) -> Result<i64, AuthError> {
     let cfg = &state.config.engine;
     let micros = parse_micros(&body.amount_usd).ok_or_else(|| AuthError::BadRequest("Enter a valid amount".into()))?;
-    if micros < cfg.global_floor_micros || micros > cfg.max_order_micros {
-        return Err(AuthError::BadRequest(format!(
-            "Amount must be between ${} and ${}",
-            format_micros(cfg.global_floor_micros),
-            format_micros(cfg.max_order_micros)
-        )));
+    if micros < cfg.global_floor_micros || cfg.max_order_micros.is_some_and(|max| micros > max) {
+        return Err(AuthError::BadRequest(match cfg.max_order_micros {
+            Some(max) => format!("Amount must be between ${} and ${}", format_micros(cfg.global_floor_micros), format_micros(max)),
+            None => format!("Amount must be at least ${}", format_micros(cfg.global_floor_micros)),
+        }));
     }
     let tradable: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM assets WHERE asset_key = $1 AND tradable AND NOT stable)")
         .bind(&body.asset_key)
@@ -366,25 +375,13 @@ async fn checked_trade(state: &ApplicationState, body: &TradeInput) -> Result<i6
 pub async fn quote(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser, Json(body): Json<TradeInput>) -> ApiResult<Value> {
     let gateway_id = active_gateway_user(&state, user_id).await?;
     let micros = checked_trade(&state, &body).await?;
-    let settlement = crate::services::catalog::quote_asset_for(&state.pool, &body.asset_key, &state.config.engine.settlement_symbols).await.map_err(internal)?;
-    let quote_asset = settlement.ok_or_else(|| AuthError::Conflict("Buying is not available right now".into()))?;
-    let quote = state
-        .tm_client
-        .get_market_quote(
-            &gateway_id,
-            &QuoteRequest {
-                base_asset: body.asset_key.clone(),
-                quote_asset,
-                qty: format_micros(micros),
-                qty_unit: QuantityUnit::Quote,
-                side: OrderSide::Buy,
-            },
-        )
-        .await
-        .map_err(|error| {
-            eprintln!("Quote failed for {user_id}: {error:#}");
-            AuthError::Conflict("We could not get a quote. Please try again.".into())
-        })?;
+    if !state.limiter.allow(&format!("quote:{user_id}"), 30, std::time::Duration::from_secs(60)) {
+        return Err(AuthError::TooManyRequests);
+    }
+    let quote = crate::services::quotes::buy(&state, &gateway_id, &body.asset_key, micros).await.map_err(|error| {
+        eprintln!("Quote failed for {user_id}: {error:#}");
+        quote_failed(&state, &error)
+    })?;
     Ok(ApiResponse::ok(
         "Quote",
         json!({ "amount_usd": format_micros(micros), "qty": quote.qty, "price": quote.price, "fee": quote.fee }),

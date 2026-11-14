@@ -26,6 +26,8 @@ pub struct BotRule {
 pub struct BotNetworkAddress {
     pub network: String,
     pub address: String,
+    // The stablecoins that can be sent to this address, the preferred one first.
+    pub assets: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -133,10 +135,11 @@ pub async fn deposit_for_user(state: &ApplicationState, user_id: uuid::Uuid) -> 
     if rows.is_empty() {
         return Ok(None);
     }
-    let networks: Vec<BotNetworkAddress> = rows
-        .into_iter()
-        .map(|(network, address)| BotNetworkAddress { network, address })
-        .collect();
+    let mut networks = Vec::new();
+    for (network, address) in rows {
+        let assets = crate::services::catalog::deposit_assets(&state.pool, &network, &state.config.engine.settlement_symbols).await?;
+        networks.push(BotNetworkAddress { network, address, assets });
+    }
     // Prefer Solana when the user has it: lower fees for small deposits.
     let default_network = networks
         .iter()
@@ -144,7 +147,8 @@ pub async fn deposit_for_user(state: &ApplicationState, user_id: uuid::Uuid) -> 
         .unwrap_or(&networks[0])
         .network
         .clone();
-    Ok(Some(BotDeposit { asset: "USDC".into(), default_network, networks }))
+    let asset = state.config.engine.settlement_symbols.first().cloned().unwrap_or_else(|| "USDC".into());
+    Ok(Some(BotDeposit { asset, default_network, networks }))
 }
 
 pub async fn get_sellable(state: &ApplicationState, from: &TelegramUser) -> anyhow::Result<Option<Vec<BotSellable>>> {

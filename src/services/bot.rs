@@ -200,13 +200,18 @@ pub mod copy {
         "<b>Not available yet</b>\n\nThat is not switched on for your account yet. Please try again later.".into()
     }
 
+    // "USDC or PYUSD": what this network takes, falling back to the main settlement asset.
+    fn accepted(net: &bot_data::BotNetworkAddress, fallback: &str) -> String {
+        if net.assets.is_empty() { fallback.to_string() } else { net.assets.join(" or ") }
+    }
+
     pub fn deposit(d: &BotDeposit) -> String {
         let Some(net) = d.networks.iter().find(|n| n.network == d.default_network) else {
             return unavailable();
         };
         format!(
-            "<b>Add funds</b>\n\nSend <b>{asset}</b> to this address on the <b>{net_name}</b> network:\n\n<code>{addr}</code>\n\n<blockquote>Only send {asset} on {net_name}. Any other asset or network can be lost for good.</blockquote>\n\nWhen your payment lands we keep your tenth and invest it, and you will get a message here.",
-            asset = h(&d.asset),
+            "<b>Add funds</b>\n\nSend <b>{asset}</b> to this address on the <b>{net_name}</b> network:\n\n<code>{addr}</code>\n\n<blockquote>Only send stablecoins on {net_name}. Any other asset or network can be lost for good.</blockquote>\n\nWhen your payment lands we keep your tenth and invest it, and you will get a message here.",
+            asset = h(&accepted(net, &d.asset)),
             net_name = h(&net.network),
             addr = h(&net.address),
         )
@@ -218,7 +223,7 @@ pub mod copy {
         }
         let mut lines = vec!["<b>Your deposit addresses</b>".to_string(), String::new()];
         for n in &d.networks {
-            lines.push(format!("<b>{}</b>, {}", h(&n.network), h(&d.asset)));
+            lines.push(format!("<b>{}</b>, {}", h(&n.network), h(&accepted(n, &d.asset))));
             lines.push(format!("<code>{}</code>", h(&n.address)));
             lines.push(String::new());
         }
@@ -573,7 +578,7 @@ mod tests {
             default_network: default.into(),
             networks: networks
                 .iter()
-                .map(|(network, address)| bot_data::BotNetworkAddress { network: network.to_string(), address: address.to_string() })
+                .map(|(network, address)| bot_data::BotNetworkAddress { network: network.to_string(), address: address.to_string(), assets: vec!["USDC".into(), "PYUSD".into()] })
                 .collect(),
         }
     }
@@ -581,7 +586,8 @@ mod tests {
     #[test]
     fn deposit_copy_names_the_asset_network_and_address_and_warns_about_mistakes() {
         let text = copy::deposit(&deposit("solana", &[("evm", "0xabc"), ("solana", "SoL1")]));
-        assert!(text.contains("Send <b>USDC</b>") && text.contains("<b>solana</b>"));
+        assert!(text.contains("Send <b>USDC or PYUSD</b>") && text.contains("<b>solana</b>"));
+        assert!(text.contains("Only send stablecoins on solana"));
         assert!(text.contains("<code>SoL1</code>") && !text.contains("0xabc"));
         assert!(text.contains("Any other asset or network can be lost for good"));
         assert!(copy::deposit(&deposit("base", &[("solana", "SoL1")])).contains("Not available yet"), "no address for the default network");

@@ -21,7 +21,7 @@ const MAX_ORDERS_PER_TICK: usize = 20;
 pub async fn run(state: ApplicationState) {
     let cfg = state.config.engine.clone();
     println!("Engine started (dry_run={}, poll={}s, deposits in {})", cfg.dry_run, cfg.poll_secs, cfg.settlement_symbols.join("/"));
-    if cfg.global_floor_micros > cfg.max_order_micros {
+    if cfg.max_order_micros.is_some_and(|max| cfg.global_floor_micros > max) {
         eprintln!("GLOBAL_FLOOR_USD is above MAX_ORDER_USD, so manual buys can never be in range");
     }
     loop {
@@ -98,12 +98,14 @@ fn warn_once_ignored(source_id: &str, symbol: &str, settlement: &[String]) {
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let first = SEEN.get_or_init(Default::default).lock().unwrap().insert(source_id.to_string());
     if first {
-        eprintln!("Ignored a received transfer of {symbol}: only {} count as deposits (set TM_SETTLEMENT_ASSET)", settlement.join(", "));
+        eprintln!("Ignored a received transfer of {symbol}: only stablecoins ({}) count as deposits", settlement.join(", "));
     }
 }
 
 async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &str) -> anyhow::Result<()> {
-    let symbols = &state.config.engine.settlement_symbols;
+    // Any stablecoin the gateway lists counts, not only the settlement asset, because the gateway credits all of them.
+    let mut symbols = state.config.engine.settlement_symbols.clone();
+    symbols.extend(crate::services::catalog::stable_symbols(&state.pool).await?);
     let response = state.tm_client.list_transactions(gateway_id).await?;
     for tx in response.data {
         let (Some(TransactionType::ReceivedTransfer), Some(TransactionStatus::Completed), Some(received)) =
@@ -114,7 +116,7 @@ async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &s
         let symbol = received.token_symbol.to_uppercase();
         let Some(micros) = parse_micros(&received.amount).filter(|m| *m > 0) else { continue };
         if !symbols.contains(&symbol) {
-            warn_once_ignored(&received.id.to_string(), &symbol, symbols);
+            warn_once_ignored(&received.id.to_string(), &symbol, &symbols);
             continue;
         }
         sqlx::query(
