@@ -4,7 +4,8 @@ use crate::models::schemas::InvestmentPlan;
 use anyhow::Result;
 
 // Stablecoins are never "tradable" at the gateway, so withdrawals are judged by stable plus a network the wallets use.
-pub const WITHDRAWABLE: &str = "stable AND chain = ANY(ARRAY['solana', 'base', 'arbitrum', 'robinhood'])";
+// A stablecoin with no chain is an exchange balance, which the gateway sends to whichever network the address is on.
+pub const WITHDRAWABLE: &str = "stable AND (chain IS NULL OR chain = ANY(ARRAY['solana', 'base', 'arbitrum', 'robinhood']))";
 
 /// The networks each kind of wallet address works on.
 pub fn chains_of(network: &str) -> &'static [&'static str] {

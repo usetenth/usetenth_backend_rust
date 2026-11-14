@@ -242,18 +242,35 @@ pub async fn remove_address(State(state): State<ApplicationState>, AuthUser(user
 }
 
 
+/// Every stablecoin the user holds, with its exact balance, so they can choose which one to withdraw from.
 pub async fn withdraw_assets(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser) -> ApiResult<Vec<Value>> {
-    // What the user holds of each, so the app can pick the stablecoin that actually has money in it.
-    let mut available = std::collections::HashMap::new();
-    if let Ok(gateway_id) = active_gateway_user(&state, user_id).await {
-        if let Ok(balances) = state.tm_client.get_user_balance(&gateway_id).await {
-            for b in balances.data {
-                if let (Some(id), Some(amount)) = (b.asset_id, b.available) {
-                    available.insert(id.to_lowercase(), amount);
-                }
+    let allowed: Vec<String> = sqlx::query_scalar(&format!("SELECT asset_key FROM assets WHERE {}", crate::services::catalog::WITHDRAWABLE))
+        .fetch_all(&state.pool)
+        .await?;
+    let allowed: std::collections::HashSet<String> = allowed.into_iter().map(|k| k.to_lowercase()).collect();
+
+    let held = match active_gateway_user(&state, user_id).await {
+        Ok(gateway_id) => state.tm_client.get_portfolio(&gateway_id).await.ok(),
+        Err(_) => None,
+    };
+    let mut items: Vec<Value> = Vec::new();
+    if let Some(portfolio) = held {
+        for b in portfolio.balances.into_iter().filter(|b| b.stable) {
+            let Some(id) = b.asset_id else { continue };
+            if parse_decimal(&b.available).is_none_or(|(n, _)| n == 0) {
+                continue;
             }
+            let key = id.to_string();
+            let family = b.chain.as_deref().map(|c| address::family_of_chain(c).as_str()).unwrap_or("any");
+            items.push(json!({
+                "asset_key": key, "symbol": b.symbol, "chain": b.chain, "chain_family": family,
+                "available": b.available, "withdrawable": allowed.contains(&key.to_lowercase()),
+            }));
         }
+        return Ok(ApiResponse::ok("Withdrawable assets", items));
     }
+
+    // The balances could not be read, so list what could be withdrawn without amounts.
     let rows: Vec<(String, String, Option<String>)> =
         sqlx::query_as(&format!("SELECT asset_key, symbol, chain FROM assets WHERE {} ORDER BY symbol, chain", crate::services::catalog::WITHDRAWABLE))
             .fetch_all(&state.pool)
@@ -262,9 +279,8 @@ pub async fn withdraw_assets(State(state): State<ApplicationState>, AuthUser(use
         "Withdrawable assets",
         rows.into_iter()
             .map(|(key, symbol, chain)| {
-                let family = address::family_of_chain(chain.as_deref().unwrap_or(""));
-                let held = available.get(&key.to_lowercase()).cloned();
-                json!({ "asset_key": key, "symbol": symbol, "chain": chain, "chain_family": family.as_str(), "available": held })
+                let family = chain.as_deref().map(|c| address::family_of_chain(c).as_str()).unwrap_or("any");
+                json!({ "asset_key": key, "symbol": symbol, "chain": chain, "chain_family": family, "available": null, "withdrawable": true })
             })
             .collect(),
     ))
@@ -295,7 +311,7 @@ pub async fn withdraw(State(state): State<ApplicationState>, AuthUser(user_id): 
     // Only queued withdrawals count toward the hourly cap, so typos never lock anyone out.
     let hour = Duration::from_secs(3600);
     let rate_key = format!("withdraw:{user_id}");
-    if state.limiter.is_blocked(&rate_key, 5, hour) {
+    if state.limiter.is_blocked(&rate_key, state.config.engine.withdrawals_per_hour, hour) {
         return Err(AuthError::TooManyRequests);
     }
     let micros = parse_micros(&body.amount_usd).ok_or_else(|| AuthError::BadRequest("Enter a valid amount".into()))?;
@@ -336,8 +352,8 @@ pub async fn withdraw(State(state): State<ApplicationState>, AuthUser(user_id): 
             .bind(&body.asset_key)
             .fetch_optional(&state.pool)
             .await?;
-    let chain = chain.ok_or_else(|| AuthError::BadRequest("That asset cannot be withdrawn".into()))?.unwrap_or_default();
-    if address::family_of_chain(&chain).as_str() != family {
+    let chain = chain.ok_or_else(|| AuthError::BadRequest("That asset cannot be withdrawn".into()))?;
+    if !address::chain_matches(chain.as_deref(), &family) {
         return Err(AuthError::BadRequest("That address is for a different network than this asset".into()));
     }
 

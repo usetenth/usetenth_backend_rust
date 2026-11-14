@@ -49,7 +49,7 @@ pub async fn challenge(state: &ApplicationState, user_id: Uuid, purpose: &str, s
     if method == Method::Password {
         return Ok((method, None));
     }
-    if !state.limiter.allow(&format!("stepup-issue:{user_id}"), 5, StdDuration::from_secs(15 * 60)) {
+    if !state.limiter.allow(&format!("stepup-issue:{user_id}"), state.config.engine.confirmations_per_15_min, StdDuration::from_secs(15 * 60)) {
         return Err(AuthError::TooManyRequests);
     }
     let chat_id: i64 = sqlx::query_scalar("SELECT telegram_id FROM users WHERE id = $1")

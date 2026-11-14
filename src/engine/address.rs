@@ -21,6 +21,15 @@ pub fn family_of_chain(chain: &str) -> Family {
     if chain.eq_ignore_ascii_case("solana") { Family::Solana } else { Family::Evm }
 }
 
+/// Whether an asset on `chain` (None for an exchange balance) can go to an address of `family`.
+pub fn chain_matches(chain: Option<&str>, family: &str) -> bool {
+    chain.is_none_or(|c| family_of_chain(c).as_str() == family)
+}
+
+pub fn family_named(name: &str) -> Family {
+    if name == "solana" { Family::Solana } else { Family::Evm }
+}
+
 pub fn detect(address: &str) -> Family {
     if address.starts_with("0x") || address.starts_with("0X") { Family::Evm } else { Family::Solana }
 }

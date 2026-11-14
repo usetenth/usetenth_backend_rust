@@ -104,14 +104,13 @@ async fn process(state: &ApplicationState, w: Row) -> anyhow::Result<()> {
     if removed || !usable {
         return fail("destination is no longer available".into()).await;
     }
-    let chain: Option<String> = sqlx::query_scalar(&format!("SELECT chain FROM assets WHERE asset_key = $1 AND {}", crate::services::catalog::WITHDRAWABLE))
+    let chain: Option<Option<String>> = sqlx::query_scalar(&format!("SELECT chain FROM assets WHERE asset_key = $1 AND {}", crate::services::catalog::WITHDRAWABLE))
         .bind(&w.asset_key)
         .fetch_optional(pool)
-        .await?
-        .flatten();
+        .await?;
     let Some(chain) = chain else { return fail("asset cannot be withdrawn".into()).await };
-    let family_enum = address::family_of_chain(&chain);
-    if family_enum.as_str() != family || address::validate(family_enum, &w.to_address).is_err() {
+    let family_enum = address::family_named(&family);
+    if !address::chain_matches(chain.as_deref(), &family) || address::validate(family_enum, &w.to_address).is_err() {
         return fail("destination does not match the asset's network".into()).await;
     }
 

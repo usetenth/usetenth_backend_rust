@@ -75,6 +75,9 @@ pub struct EngineConfig {
     pub max_user_daily_micros: Option<i64>,
     // Gateway execute `auth_type`; no default, and live trading refuses to start without it.
     pub execute_auth_type: Option<String>,
+    // How many withdrawals one user may queue per hour, and how many confirmation requests per 15 minutes.
+    pub withdrawals_per_hour: u32,
+    pub confirmations_per_15_min: u32,
     // How long a newly saved withdrawal address must wait before money can be sent to it.
     pub withdraw_address_cooldown_secs: i64,
 }
@@ -182,6 +185,8 @@ impl EngineConfig {
                 None => None,
             },
             execute_auth_type: std::env::var("TM_EXECUTE_AUTH_TYPE").ok().filter(|v| !v.trim().is_empty()),
+            withdrawals_per_hour: std::env::var("WITHDRAWALS_PER_HOUR").ok().and_then(|v| v.parse().ok()).unwrap_or(5),
+            confirmations_per_15_min: std::env::var("CONFIRMATIONS_PER_15_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(5),
             withdraw_address_cooldown_secs: std::env::var("WITHDRAW_ADDRESS_COOLDOWN_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(86_400),
         };
         anyhow::ensure!(!config.settlement_symbols.is_empty(), "TM_SETTLEMENT_ASSET must name at least one symbol");
@@ -303,6 +308,8 @@ impl EngineConfig {
             max_order_micros: Some(50_000_000),
             max_user_daily_micros: None,
             execute_auth_type: Some("test_auth".into()),
+            withdrawals_per_hour: 5,
+            confirmations_per_15_min: 5,
             withdraw_address_cooldown_secs: 86_400,
         }
     }

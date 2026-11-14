@@ -887,29 +887,35 @@ async fn the_app_lists_notifications_and_marks_them_read(pool: PgPool) {
 // ---- Withdrawable assets ----
 
 #[sqlx::test]
-async fn stablecoins_can_be_withdrawn_even_though_the_gateway_marks_them_not_tradable(pool: PgPool) {
+async fn the_withdraw_list_shows_each_stablecoin_held_with_its_exact_balance(pool: PgPool) {
+    use crate::engine::worker_tests::USDC_SOL;
     let mock = Mock::new("complete");
     let st = app_state(&pool, &mock).await;
-    for (key, chain) in [("usdc-sol", Some("solana")), ("usdc-base", Some("base")), ("usdc-arb", Some("arbitrum")), ("usdc-hyper", Some("hypercore-spot")), ("usdc-cefi", None)] {
-        sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, tradable, stable) VALUES ($1, 'USDC', 'USD Coin', $2, false, true)").bind(key).bind(chain).execute(&pool).await.unwrap();
-    }
+    sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, tradable, stable) VALUES ($1, 'USDC', 'USD Coin', 'solana', false, true)").bind(USDC_SOL).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, tradable, stable) VALUES ('usdc-hyper', 'USDC', 'USD Coin', 'hypercore-spot', false, true)").execute(&pool).await.unwrap();
     let user = seed_user(&pool).await;
     let token = auth::access_token_for_tests(&st, user).await;
     let base = serve_router(st).await;
+    let client = reqwest::Client::new();
 
-    let body: Value = reqwest::Client::new().get(format!("{base}/v1/withdraw/assets")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
-    let mut chains: Vec<(String, String)> = body["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| (a["chain"].as_str().unwrap().to_string(), a["chain_family"].as_str().unwrap().to_string()))
-        .collect();
-    chains.sort();
-    assert_eq!(
-        chains,
-        vec![("arbitrum".to_string(), "evm".to_string()), ("base".to_string(), "evm".to_string()), ("solana".to_string(), "solana".to_string())],
-        "the networks the wallets use, never the exchange or Hypercore"
-    );
+    let body: Value = client.get(format!("{base}/v1/withdraw/assets")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+    let items = body["data"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only what is held: the test account holds USDC and a stock, and the stock is not a stablecoin");
+    assert_eq!(items[0]["symbol"], "USDC");
+    assert_eq!(items[0]["available"], "100");
+    assert_eq!(items[0]["withdrawable"], true);
+
+    sqlx::query("DELETE FROM assets WHERE asset_key = $1").bind(USDC_SOL).execute(&pool).await.unwrap();
+    let body: Value = client.get(format!("{base}/v1/withdraw/assets")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["data"][0]["withdrawable"], false, "a balance the catalogue does not know is shown but cannot be chosen");
+}
+
+#[test]
+fn an_exchange_balance_has_no_chain_and_goes_to_either_kind_of_address() {
+    use crate::engine::address::chain_matches;
+    assert!(chain_matches(None, "solana") && chain_matches(None, "evm"));
+    assert!(chain_matches(Some("solana"), "solana") && !chain_matches(Some("solana"), "evm"));
+    assert!(chain_matches(Some("base"), "evm") && !chain_matches(Some("base"), "solana"));
 }
 
 // ---- Approving in Telegram ----
