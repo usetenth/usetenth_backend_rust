@@ -1,4 +1,6 @@
 /target
+.idea
+.idea/*
 .env
 .env.local
 usetenth_truemarkets-org-api-key-*.json
