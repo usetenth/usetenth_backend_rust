@@ -1,4 +1,12 @@
 /target
-.env
-*.json
 .git
+.github
+.idea
+.env
+.env.*
+!.env.example
+*.json
+*.deb
+*.md
+compose*.yml
+Caddyfile

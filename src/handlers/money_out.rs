@@ -198,7 +198,7 @@ pub async fn add_address(State(state): State<ApplicationState>, AuthUser(user_id
     let (id, usable_at) = match inserted {
         Ok(row) => row,
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            return Err(AuthError::Conflict("You already saved that address".into()));
+            return Err(AuthError::Conflict("You already saved that address. An EVM address works on every EVM network (Base, Arbitrum, Robinhood Chain), so pick the token you want to send when you withdraw.".into()));
         }
         Err(e) => return Err(e.into()),
     };
@@ -262,9 +262,25 @@ pub async fn withdraw_assets(State(state): State<ApplicationState>, AuthUser(use
             }
             let key = id.to_string();
             let family = b.chain.as_deref().map(|c| address::family_of_chain(c).as_str()).unwrap_or("any");
+            let mut withdrawable = allowed.contains(&key.to_lowercase());
+            if !withdrawable && crate::services::catalog::withdrawable_chain(b.chain.as_deref()) {
+                // A balance the catalogue has not met yet (a different listing of the same coin) is added from what the gateway reports.
+                let stored = sqlx::query(
+                    "INSERT INTO assets (asset_key, symbol, name, chain, address, asset_class, tradable, stable, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, 'crypto', false, true, now()) ON CONFLICT (asset_key) DO NOTHING",
+                )
+                .bind(&key)
+                .bind(&b.symbol)
+                .bind(b.name.clone().unwrap_or_else(|| b.symbol.clone()))
+                .bind(&b.chain)
+                .bind(&b.address)
+                .execute(&state.pool)
+                .await;
+                withdrawable = stored.is_ok();
+            }
             items.push(json!({
                 "asset_key": key, "symbol": b.symbol, "chain": b.chain, "chain_family": family,
-                "available": b.available, "withdrawable": allowed.contains(&key.to_lowercase()),
+                "available": b.available, "withdrawable": withdrawable,
             }));
         }
         return Ok(ApiResponse::ok("Withdrawable assets", items));

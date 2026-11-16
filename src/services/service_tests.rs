@@ -907,7 +907,9 @@ async fn the_withdraw_list_shows_each_stablecoin_held_with_its_exact_balance(poo
 
     sqlx::query("DELETE FROM assets WHERE asset_key = $1").bind(USDC_SOL).execute(&pool).await.unwrap();
     let body: Value = client.get(format!("{base}/v1/withdraw/assets")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
-    assert_eq!(body["data"][0]["withdrawable"], false, "a balance the catalogue does not know is shown but cannot be chosen");
+    assert_eq!(body["data"][0]["withdrawable"], true, "a balance the catalogue has not met is added from what the gateway reports");
+    let learned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE asset_key = $1 AND stable").bind(USDC_SOL).fetch_one(&pool).await.unwrap();
+    assert_eq!(learned, 1);
 }
 
 #[test]

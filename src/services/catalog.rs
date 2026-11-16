@@ -7,6 +7,13 @@ use anyhow::Result;
 // A stablecoin with no chain is an exchange balance, which the gateway sends to whichever network the address is on.
 pub const WITHDRAWABLE: &str = "stable AND (chain IS NULL OR chain = ANY(ARRAY['solana', 'base', 'arbitrum', 'robinhood']))";
 
+const WITHDRAW_CHAINS: [&str; 4] = ["solana", "base", "arbitrum", "robinhood"];
+
+/// Whether a stablecoin on `chain` (None for an exchange balance) can be withdrawn; the SQL above says the same.
+pub fn withdrawable_chain(chain: Option<&str>) -> bool {
+    chain.is_none_or(|c| WITHDRAW_CHAINS.contains(&c))
+}
+
 /// The networks each kind of wallet address works on.
 pub fn chains_of(network: &str) -> &'static [&'static str] {
     match network {
@@ -212,5 +219,15 @@ mod tests {
         assert_eq!(odd.iter().map(|(_, v)| v).sum::<i32>(), 10_000);
         assert_eq!(normalize_bps(&w(&[("only", 123)])), w(&[("only", 10_000)]));
         assert!(normalize_bps(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_sql_and_rust_rules_for_withdrawable_chains_agree() {
+        for chain in WITHDRAW_CHAINS {
+            assert!(WITHDRAWABLE.contains(&format!("'{chain}'")), "{chain}");
+            assert!(withdrawable_chain(Some(chain)));
+        }
+        assert!(withdrawable_chain(None));
+        assert!(!withdrawable_chain(Some("hypercore-spot")));
     }
 }
