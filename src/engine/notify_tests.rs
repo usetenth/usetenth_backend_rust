@@ -183,7 +183,7 @@ async fn notices(pool: &PgPool, user: Uuid) -> Vec<(String, String)> {
 fn a_deposit_notice_says_what_arrived_and_what_happens_next() {
     assert_eq!(
         deposit_summary(19_840_000, "USDC", Some(3_968_000), Some("pending"), None),
-        "$19.84 USDC just arrived in your wallet. We are investing your tenth, $3.968."
+        "$19.84 USDC just arrived in your wallet. We are investing your tenth, $3.96."
     );
     assert!(deposit_summary(5_000_000, "USDC", Some(0), Some("skipped"), Some("below_minimum")).contains("too small to invest"));
     assert!(deposit_summary(5_000_000, "USDC", Some(0), Some("skipped"), Some("daily_limit")).contains("investing limit"));
@@ -203,7 +203,7 @@ async fn every_deposit_is_announced_in_the_app_and_on_telegram_once(pool: PgPool
     notify_deposits(&st).await.unwrap();
     let telegram = texts(&mock);
     assert_eq!(telegram.len(), 1);
-    assert!(telegram[0].starts_with("<b>Payment received</b>") && telegram[0].contains("$19.84 USDC") && telegram[0].contains("$3.968"));
+    assert!(telegram[0].starts_with("<b>Payment received</b>") && telegram[0].contains("$19.84 USDC") && telegram[0].contains("$3.96"));
     let rows = notices(&pool, user).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, "Payment received");

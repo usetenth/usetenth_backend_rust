@@ -26,6 +26,13 @@ pub fn format_micros(micros: i64) -> String {
     format!("{sign}{whole}.{frac}")
 }
 
+/// Whole cents, cut off rather than rounded, so a notice reads the same as the app.
+pub fn format_cents(micros: i64) -> String {
+    let sign = if micros < 0 { "-" } else { "" };
+    let abs = micros.unsigned_abs();
+    format!("{sign}{}.{:02}", abs / MICROS_PER_USD as u64, (abs % MICROS_PER_USD as u64) / 10_000)
+}
+
 pub fn parse_decimal(value: &str) -> Option<(i128, u32)> {
     let value = value.trim();
     let (whole, frac) = value.split_once('.').unwrap_or((value, ""));
@@ -87,6 +94,15 @@ pub fn split_bps(total: i64, weights: &[(String, i32)]) -> Vec<(String, i64)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notices_show_whole_cents_cut_off_to_match_the_app() {
+        assert_eq!(super::format_cents(19_339_226), "19.33");
+        assert_eq!(super::format_cents(3_867_845), "3.86");
+        assert_eq!(super::format_cents(8_000_000), "8.00");
+        assert_eq!(super::format_cents(5_000), "0.00");
+        assert_eq!(super::format_cents(-2_500_000), "-2.50");
+    }
+
     use super::*;
 
     #[test]

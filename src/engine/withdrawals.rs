@@ -1,7 +1,7 @@
 //! Withdrawals: destination and gateway record are re-verified before signing, and nothing is re-created or re-signed once signed.
 
 use super::address;
-use super::money::{cmp_decimal, format_micros};
+use super::money::{cmp_decimal, format_cents, format_micros};
 use crate::app_state::ApplicationState;
 use crate::integrations::types::{QuantityUnit, TransferRequest, TransferStatus};
 use crate::services::telegram_service::TelegramService;
@@ -279,7 +279,7 @@ pub async fn notify(state: &ApplicationState) -> anyhow::Result<()> {
     .fetch_all(pool)
     .await?;
     for (id, user_id, chat, status, micros) in due {
-        let amount = usd(&format_micros(micros));
+        let amount = usd(&format_cents(micros));
         let (title, body) = if status == "completed" {
             ("Withdrawal sent", format!("{amount} is on its way to your saved address."))
         } else {

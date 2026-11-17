@@ -1,4 +1,4 @@
-use super::money::{format_micros, parse_micros};
+use super::money::{format_cents, format_micros, parse_micros};
 use super::planner::{self, Context, Decision, RuleInput};
 use crate::app_state::ApplicationState;
 use crate::config::EngineConfig;
@@ -21,6 +21,10 @@ const FAST_LANE_WINDOW: &str = "10 minutes";
 static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 // An order stuck mid-flight this long is resolved by asking the gateway what happened.
 const STALE_SECS: i64 = 300;
+// A stuck order is asked about after this long; only an order the gateway never ran waits the full STALE_SECS before it is placed again.
+const RESOLVE_SECS: i64 = 8;
+// An automatic order the gateway reports as failed placed nothing, so it is placed again this many times before giving up.
+const FAILED_LEG_RETRIES: i32 = 2;
 const MAX_ORDERS_PER_TICK: usize = 20;
 
 pub async fn run(state: ApplicationState) {
@@ -558,24 +562,30 @@ async fn process_order(state: &ApplicationState, order: OrderRow) -> anyhow::Res
 }
 
 /// Resolves stuck orders by asking the gateway; the only place a not-executed order is re-placed.
+/// A running or finished order is recognised within seconds. An order the gateway shows as not executed may still be
+/// running there after a timeout, so it is placed again only once it has been quiet for the full STALE_SECS.
 pub async fn recover_stale(state: &ApplicationState) -> anyhow::Result<()> {
     let pool = &state.pool;
-    let stuck: Vec<(Uuid, Uuid, Option<String>, i32)> = sqlx::query_as(
-        "SELECT id, user_id, gateway_order_id, attempt_count FROM orders
+    let stuck: Vec<(Uuid, Uuid, Option<String>, i32, String, bool)> = sqlx::query_as(
+        "SELECT id, user_id, gateway_order_id, attempt_count, kind, updated_at < now() - ($2::BIGINT * interval '1 second') AS old_enough
+         FROM orders
          WHERE status IN ('processing', 'submitted') AND updated_at < now() - ($1::BIGINT * interval '1 second')
          ORDER BY updated_at LIMIT 20",
     )
+    .bind(RESOLVE_SECS)
     .bind(STALE_SECS)
     .fetch_all(pool)
     .await?;
 
-    for (id, user_id, gateway_order_id, attempts) in stuck {
+    for (id, user_id, gateway_order_id, attempts, kind, old_enough) in stuck {
         let result: anyhow::Result<()> = async {
             let Some(gateway_order_id) = gateway_order_id else {
-                sqlx::query("UPDATE orders SET status = 'pending', updated_at = now() WHERE id = $1")
-                    .bind(id)
-                    .execute(pool)
-                    .await?;
+                if old_enough {
+                    sqlx::query("UPDATE orders SET status = 'pending', updated_at = now() WHERE id = $1")
+                        .bind(id)
+                        .execute(pool)
+                        .await?;
+                }
                 return Ok(());
             };
             let gateway_user: String = sqlx::query_scalar("SELECT gateway_user_id FROM users WHERE id = $1")
@@ -585,7 +595,17 @@ pub async fn recover_stale(state: &ApplicationState) -> anyhow::Result<()> {
             let status = state.tm_client.get_order_status(&gateway_user, &gateway_order_id).await?.status;
             match outcome(status) {
                 Outcome::Done | Outcome::InFlight => set_status(pool, id, "awaiting_settlement", None).await?,
-                Outcome::Failed => set_status(pool, id, "failed", Some("gateway reported the order failed")).await?,
+                Outcome::Failed => {
+                    // The status call carries no reason, so the order's own record is asked for it.
+                    let reason = match state.tm_client.get_order(&gateway_user, &gateway_order_id).await {
+                        Ok(detail) => detail.failure_reason,
+                        Err(_) => None,
+                    }
+                    .unwrap_or_else(|| "gateway reported the order failed".into());
+                    eprintln!("Order {id} failed at the gateway: {reason}");
+                    fail_or_retry(pool, id, &kind, attempts, &reason).await?
+                }
+                Outcome::NotExecuted if !old_enough => {}
                 Outcome::NotExecuted if attempts >= MAX_ATTEMPTS => {
                     set_status(pool, id, "needs_review", Some("order was never executed and retries are exhausted")).await?
                 }
@@ -608,16 +628,33 @@ pub async fn recover_stale(state: &ApplicationState) -> anyhow::Result<()> {
     Ok(())
 }
 
+// A failed order placed nothing at the gateway. An automatic one is tried again shortly; a manual one is the user's to repeat.
+async fn fail_or_retry(pool: &PgPool, id: Uuid, kind: &str, attempts: i32, reason: &str) -> anyhow::Result<()> {
+    if kind == "auto" && attempts <= FAILED_LEG_RETRIES {
+        sqlx::query(
+            "UPDATE orders SET status = 'pending', failure_reason = $2, gateway_order_id = NULL,
+                    next_attempt_at = now() + interval '20 seconds', updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(reason)
+        .execute(pool)
+        .await?;
+        return Ok(());
+    }
+    set_status(pool, id, "failed", Some(reason)).await
+}
+
 pub async fn reconcile(state: &ApplicationState) -> anyhow::Result<()> {
     let pool = &state.pool;
-    let open: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT id, user_id, gateway_order_id FROM orders
+    let open: Vec<(Uuid, Uuid, String, String, i32)> = sqlx::query_as(
+        "SELECT id, user_id, gateway_order_id, kind, attempt_count FROM orders
          WHERE status = 'awaiting_settlement' AND gateway_order_id IS NOT NULL ORDER BY updated_at LIMIT 50",
     )
     .fetch_all(pool)
     .await?;
 
-    for (id, user_id, gateway_order_id) in open {
+    for (id, user_id, gateway_order_id, kind, attempts) in open {
         let result: anyhow::Result<()> = async {
             let gateway_user: String = sqlx::query_scalar("SELECT gateway_user_id FROM users WHERE id = $1")
                 .bind(user_id)
@@ -634,7 +671,7 @@ pub async fn reconcile(state: &ApplicationState) -> anyhow::Result<()> {
                 }
                 Outcome::Failed => {
                     let reason = detail.failure_reason.unwrap_or_else(|| "gateway reported the order failed".into());
-                    set_status(pool, id, "failed", Some(&reason)).await?;
+                    fail_or_retry(pool, id, &kind, attempts, &reason).await?;
                 }
                 Outcome::InFlight | Outcome::NotExecuted => {}
             }
@@ -679,11 +716,11 @@ pub async fn finalize_investments(pool: &PgPool) -> anyhow::Result<()> {
 
 /// What a deposit notice says: the payment first, then what happens to the tenth.
 pub fn deposit_summary(amount_micros: i64, asset: &str, invest_micros: Option<i64>, status: Option<&str>, skip_reason: Option<&str>) -> String {
-    let arrived = format!("{} {asset} just arrived in your wallet.", usd(&format_micros(amount_micros)));
+    let arrived = format!("{} {asset} just arrived in your wallet.", usd(&format_cents(amount_micros)));
     let next = match (invest_micros, status, skip_reason) {
         (_, Some("simulated"), _) => " Test mode is on, so nothing was invested and it stays in your balance.".to_string(),
         (Some(micros), Some(s), _) if micros > 0 && s != "skipped" && s != "failed" => {
-            format!(" We are investing your tenth, {}.", usd(&format_micros(micros)))
+            format!(" We are investing your tenth, {}.", usd(&format_cents(micros)))
         }
         (_, Some("skipped"), Some("below_minimum")) => " It was too small to invest from, so it stays in your balance.".to_string(),
         (_, Some("skipped"), Some("daily_limit")) => " You have reached today's investing limit, so it stays in your balance.".to_string(),
@@ -739,7 +776,7 @@ pub async fn notify_users(state: &ApplicationState) -> anyhow::Result<()> {
     .fetch_all(pool)
     .await?;
     for (id, user_id, chat, status, invest_micros) in due {
-        let amount = usd(&format_micros(invest_micros));
+        let amount = usd(&format_cents(invest_micros));
         let (title, body) = match status.as_str() {
             "completed" => ("Your tenth is invested", format!("We invested {amount} from your latest payment.")),
             "partial" => ("Part of your tenth is invested", format!("Some of your {amount} was invested. The rest stays in your balance and we are looking into it.")),

@@ -491,7 +491,7 @@ pub async fn challenge(State(state): State<ApplicationState>, AuthUser(user_id):
             let to = to.ok_or_else(|| AuthError::NotFound("Address not found".into()))?;
             let summary = format!(
                 "<b>Confirm a withdrawal</b>\n\n{} to\n<code>{}</code>",
-                crate::utils::usd(&format_micros(micros)),
+                crate::utils::usd(&crate::engine::money::format_cents(micros)),
                 crate::utils::escape_html(&to)
             );
             (step_up::withdraw_purpose(address_id, &asset_key, micros, &reference), summary)

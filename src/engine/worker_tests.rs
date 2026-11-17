@@ -154,7 +154,7 @@ async fn serve(mock: Mock) -> String {
         Json(json!({ "status": *m.status.lock().unwrap() }))
     }
     async fn detail(State(m): State<Mock>, Path(_id): Path<String>) -> Json<Value> {
-        Json(json!({ "status": *m.status.lock().unwrap(), "tx_hash": "0xabc" }))
+        Json(json!({ "status": *m.status.lock().unwrap(), "tx_hash": "0xabc", "failure_reason": "no liquidity" }))
     }
     async fn create_transfer(State(m): State<Mock>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
         m.transfers.fetch_add(1, Ordering::SeqCst);
@@ -620,7 +620,7 @@ async fn an_order_the_gateway_never_executed_is_placed_again_once(pool: PgPool) 
 }
 
 #[sqlx::test]
-async fn failed_gateway_orders_fail_the_investment(pool: PgPool) {
+async fn failed_gateway_orders_are_placed_again_twice_and_then_fail_the_investment(pool: PgPool) {
     seed_assets(&pool).await;
     let user = seed_user(&pool).await;
     seed_deposit(&pool, user, 100_000_000, "1 hour").await;
@@ -629,12 +629,103 @@ async fn failed_gateway_orders_fail_the_investment(pool: PgPool) {
     state.signing.ensure_user_key(user).await.unwrap();
 
     plan_investments(&pool, &state.config.engine).await.unwrap();
+    for round in 1..=3 {
+        sqlx::query("UPDATE orders SET next_attempt_at = NULL").execute(&pool).await.unwrap();
+        execute_pending(&state).await.unwrap();
+        reconcile(&state).await.unwrap();
+        finalize_investments(&pool).await.unwrap();
+        let expected = if round < 3 { "pending" } else { "failed" };
+        assert_eq!(order_statuses(&pool).await, vec![expected, expected], "after attempt {round}");
+        assert_eq!(investment_status(&pool).await, if round < 3 { "pending" } else { "failed" });
+    }
+    assert_eq!(mock.creates(), 6, "three placements for each of the two orders, never more");
+}
+
+#[sqlx::test]
+async fn a_manual_order_the_gateway_fails_is_not_placed_again(pool: PgPool) {
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    let mock = Mock::new("failed");
+    let state = state(&pool, &mock, false).await;
+    state.signing.ensure_user_key(user).await.unwrap();
+    sqlx::query("INSERT INTO orders (user_id, kind, side, asset_key, amount_micros, status) VALUES ($1, 'manual', 'buy', 'spy-id', 5000000, 'pending')")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    execute_pending(&state).await.unwrap();
+    reconcile(&state).await.unwrap();
+    assert_eq!(order_statuses(&pool).await, vec!["failed"]);
+    assert_eq!(mock.creates(), 1);
+}
+
+#[sqlx::test]
+async fn an_unclear_execute_is_resolved_within_seconds_when_the_gateway_shows_the_order_moving(pool: PgPool) {
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    seed_deposit(&pool, user, 100_000_000, "1 hour").await;
+    let mock = Mock::new("pending");
+    mock.execute_fails.store(true, Ordering::SeqCst);
+    let state = state(&pool, &mock, false).await;
+    state.signing.ensure_user_key(user).await.unwrap();
+
+    plan_investments(&pool, &state.config.engine).await.unwrap();
+    execute_pending(&state).await.unwrap();
+    recover_stale(&state).await.unwrap();
+    assert_eq!(order_statuses(&pool).await, vec!["submitted", "submitted"], "asked too soon to be worth asking");
+
+    sqlx::query("UPDATE orders SET updated_at = now() - interval '15 seconds'").execute(&pool).await.unwrap();
+    recover_stale(&state).await.unwrap();
+    assert_eq!(order_statuses(&pool).await, vec!["awaiting_settlement", "awaiting_settlement"]);
+    assert_eq!((mock.creates(), mock.executes()), (2, 2), "nothing was placed or executed again");
+}
+
+#[sqlx::test]
+async fn an_order_the_gateway_shows_as_not_run_is_not_placed_again_until_it_has_been_quiet_for_minutes(pool: PgPool) {
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    seed_deposit(&pool, user, 100_000_000, "1 hour").await;
+    let mock = Mock::new("initialized");
+    mock.execute_fails.store(true, Ordering::SeqCst);
+    let state = state(&pool, &mock, false).await;
+    state.signing.ensure_user_key(user).await.unwrap();
+
+    plan_investments(&pool, &state.config.engine).await.unwrap();
+    execute_pending(&state).await.unwrap();
+    sqlx::query("UPDATE orders SET updated_at = now() - interval '15 seconds'").execute(&pool).await.unwrap();
+    recover_stale(&state).await.unwrap();
+    assert_eq!(order_statuses(&pool).await, vec!["submitted", "submitted"], "it may still be running at the gateway");
+
+    sqlx::query("UPDATE orders SET updated_at = now() - interval '10 minutes'").execute(&pool).await.unwrap();
+    recover_stale(&state).await.unwrap();
+    assert_eq!(order_statuses(&pool).await, vec!["pending", "pending"]);
+}
+
+#[sqlx::test]
+async fn a_leg_the_gateway_reports_failed_after_an_unclear_execute_is_retried_and_the_tenth_completes(pool: PgPool) {
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    seed_deposit(&pool, user, 100_000_000, "1 hour").await;
+    let mock = Mock::new("failed");
+    mock.execute_fails.store(true, Ordering::SeqCst);
+    let state = state(&pool, &mock, false).await;
+    state.signing.ensure_user_key(user).await.unwrap();
+
+    plan_investments(&pool, &state.config.engine).await.unwrap();
+    execute_pending(&state).await.unwrap();
+    sqlx::query("UPDATE orders SET updated_at = now() - interval '15 seconds'").execute(&pool).await.unwrap();
+    recover_stale(&state).await.unwrap();
+    assert_eq!(order_statuses(&pool).await, vec!["pending", "pending"], "failed at the gateway, so placed again");
+
+    *mock.status.lock().unwrap() = "complete".into();
+    mock.execute_fails.store(false, Ordering::SeqCst);
+    sqlx::query("UPDATE orders SET next_attempt_at = NULL").execute(&pool).await.unwrap();
     execute_pending(&state).await.unwrap();
     reconcile(&state).await.unwrap();
     finalize_investments(&pool).await.unwrap();
-
-    assert_eq!(order_statuses(&pool).await, vec!["failed", "failed"]);
-    assert_eq!(investment_status(&pool).await, "failed");
+    assert_eq!(order_statuses(&pool).await, vec!["completed", "completed"]);
+    assert_eq!(investment_status(&pool).await, "completed");
 }
 
 #[sqlx::test]
@@ -659,4 +750,26 @@ async fn concurrent_workers_never_place_an_order_twice(pool: PgPool) {
     );
     assert_eq!((mock.creates(), mock.executes()), (6, 6));
     assert!(order_statuses(&pool).await.iter().all(|s| s == "awaiting_settlement"));
+}
+
+#[sqlx::test]
+async fn the_reason_the_gateway_gave_for_a_failed_order_is_kept_so_it_can_be_looked_into(pool: PgPool) {
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    let mock = Mock::new("failed");
+    mock.execute_fails.store(true, Ordering::SeqCst);
+    let state = state(&pool, &mock, false).await;
+    state.signing.ensure_user_key(user).await.unwrap();
+    sqlx::query("INSERT INTO orders (user_id, kind, side, asset_key, amount_micros, status) VALUES ($1, 'manual', 'buy', 'spy-id', 5000000, 'pending')")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    execute_pending(&state).await.unwrap();
+    sqlx::query("UPDATE orders SET updated_at = now() - interval '15 seconds'").execute(&pool).await.unwrap();
+    recover_stale(&state).await.unwrap();
+
+    let (status, reason): (String, Option<String>) = sqlx::query_as("SELECT status, failure_reason FROM orders").fetch_one(&pool).await.unwrap();
+    assert_eq!((status.as_str(), reason.as_deref()), ("failed", Some("no liquidity")));
 }
