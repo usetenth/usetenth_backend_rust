@@ -247,6 +247,9 @@ async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &s
         .await?;
         recorded += inserted.rows_affected() as usize;
         crate::services::pending::clear(&state.pool, user_id, &received.tx_hash).await?;
+        if inserted.rows_affected() > 0 {
+            crate::services::pending::settle(&state.pool, user_id, &symbol, micros).await?;
+        }
     }
     Ok((recorded, pending))
 }

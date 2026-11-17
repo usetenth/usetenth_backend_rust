@@ -70,6 +70,8 @@ pub struct AlchemyConfig {
     // (network, webhook id) pairs, network being "evm" or "solana".
     pub webhooks: Vec<(String, String)>,
     pub signing_keys: Vec<String>,
+    // Solana RPC URL, used to read the amount of a Solana transfer from its signature.
+    pub solana_rpc: Option<String>,
 }
 
 impl AlchemyConfig {
@@ -100,6 +102,7 @@ impl AlchemyConfig {
             auth_token: std::env::var("ALCHEMY_AUTH_TOKEN").ok().filter(|t| !t.trim().is_empty()),
             webhooks,
             signing_keys,
+            solana_rpc: std::env::var("ALCHEMY_SOLANA_ENDPOINT").ok().filter(|u| u.trim().starts_with("https://")).map(|u| u.trim().to_string()),
         })
     }
 }

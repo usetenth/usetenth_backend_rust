@@ -52,6 +52,8 @@ pub(crate) struct Mock {
     pub(crate) alchemy_down: Arc<AtomicBool>,
     // How many Telegram messages had been sent when the first order was created.
     pub(crate) first_create_messages: Arc<Mutex<Option<usize>>>,
+    // What the Solana RPC answers to getTransaction.
+    pub(crate) solana_tx: Arc<Mutex<Value>>,
 }
 
 impl Mock {
@@ -87,6 +89,7 @@ impl Mock {
             alchemy: Default::default(),
             alchemy_down: Default::default(),
             first_create_messages: Default::default(),
+            solana_tx: Arc::new(Mutex::new(Value::Null)),
         }
     }
     pub(crate) fn creates(&self) -> usize {
@@ -271,6 +274,9 @@ async fn serve(mock: Mock) -> String {
         m.transaction_calls.fetch_add(1, Ordering::SeqCst);
         Json(json!({ "data": *m.transactions.lock().unwrap() }))
     }
+    async fn solana_rpc(State(m): State<Mock>, Json(_): Json<Value>) -> Json<Value> {
+        Json(m.solana_tx.lock().unwrap().clone())
+    }
     async fn update_webhook_addresses(State(m): State<Mock>, headers: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
         let token = headers.get("x-alchemy-token").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
         m.alchemy.lock().unwrap().push((token, body));
@@ -313,6 +319,7 @@ async fn serve(mock: Mock) -> String {
         .route("/verification/vnin-basic", post(prembly_nin))
         .route("/api/v1/kyc/nin", get(dojah_nin))
         .route("/alchemy/update-webhook-addresses", patch(update_webhook_addresses))
+        .route("/solana-rpc", post(solana_rpc))
         .with_state(mock);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -356,6 +363,7 @@ pub(crate) fn with_alchemy(state: &mut ApplicationState) {
         auth_token: Some("tok".into()),
         webhooks: vec![("evm".into(), "wh_base".into()), ("evm".into(), "wh_robinhood".into()), ("solana".into(), "wh_sol".into())],
         signing_keys: vec!["sign-key".into()],
+        solana_rpc: Some(format!("{origin}/solana-rpc")),
     });
 }
 

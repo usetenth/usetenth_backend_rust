@@ -1,4 +1,4 @@
-use crate::{app_state::ApplicationState, engine::worker, services::pending};
+use crate::{app_state::ApplicationState, engine::worker, services::{chain_watch, pending}};
 use axum::{
     body::Bytes,
     extract::State,
@@ -76,8 +76,19 @@ pub async fn alchemy(State(state): State<ApplicationState>, headers: HeaderMap, 
                 println!("Chain alert matched {} user(s)", users.len());
                 let transfers = pending::evm_transfers(&payload);
                 if transfers.is_empty() {
-                    // The shape of non-EVM alerts is not known yet, so the first part of each is logged to learn it.
-                    println!("Chain alert payload: {}", body_preview(&body));
+                    // Solana alerts only name the transaction, so its amount is read from the chain.
+                    let signatures = chain_watch::solana_signatures(&payload);
+                    if signatures.is_empty() {
+                        println!("Chain alert payload: {}", body_preview(&body));
+                    }
+                    for signature in signatures.into_iter().take(5) {
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = chain_watch::note_solana(&state, &signature).await {
+                                eprintln!("Could not read the Solana transfer: {error:#}");
+                            }
+                        });
+                    }
                 } else if let Err(error) = pending::record_pending(&state.pool, &transfers).await {
                     eprintln!("Could not note the incoming transfer: {error:#}");
                 }

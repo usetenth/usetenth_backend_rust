@@ -58,7 +58,7 @@ fn token_transfers_are_read_from_an_evm_alert_and_removed_or_native_ones_are_not
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].to, "0xbe3f4b43db5eb49d1f48f53443b9abce45da3b79");
     assert_eq!(found[0].contract, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
-    assert_eq!(found[0].tx_hash, "0xabc");
+    assert_eq!(found[0].tx_hash, "abc", "stored without the 0x, in lowercase");
     assert_eq!(found[0].micros, Some(5_250_000));
     assert!(pending::evm_transfers(&json!({})).is_empty());
 }
@@ -138,7 +138,7 @@ async fn a_pending_transfer_listed_by_the_gateway_is_shown_until_it_is_credited(
 }
 
 #[sqlx::test]
-async fn payments_being_invested_and_sales_settling_are_listed_and_finished_ones_are_not(pool: PgPool) {
+async fn payments_being_invested_and_sales_settling_are_listed_and_failed_ones_are_not(pool: PgPool) {
     seed_assets(&pool).await;
     let user = seed_user(&pool).await;
     let deposit = seed_deposit(&pool, user, 20_000_000, "1 minute").await;
@@ -168,10 +168,12 @@ async fn payments_being_invested_and_sales_settling_are_listed_and_finished_ones
     assert_eq!(deposits.len(), 1);
     assert_eq!((deposits[0]["stage"].as_str(), deposits[0]["invest_usd"].as_str()), (Some("investing"), Some("4.00")));
     let sales = view["sales"].as_array().unwrap();
-    assert_eq!(sales.len(), 1, "only the sale still settling");
-    assert_eq!(sales[0]["asset_key"], "spy-id");
-    assert_eq!(sales[0]["qty"], "0.5");
-    assert_eq!(sales[0]["amount_usd"], "9.00");
+    assert_eq!(sales.len(), 2, "the sale still settling and the one that just finished, but not the failed one");
+    let settling = sales.iter().find(|s| s["done"] == false).expect("the open sale");
+    assert_eq!(settling["asset_key"], "spy-id");
+    assert_eq!(settling["qty"], "0.5");
+    assert_eq!(settling["amount_usd"], "9.00");
+    assert!(sales.iter().any(|s| s["done"] == true), "a just-finished sale is kept, marked done");
 }
 
 #[sqlx::test]
@@ -182,4 +184,137 @@ async fn pending_work_is_private_to_its_user(pool: PgPool) {
 
     assert_eq!(pending::pending_for(&pool, first).await.unwrap()["deposits"].as_array().unwrap().len(), 1);
     assert!(pending::pending_for(&pool, second).await.unwrap()["deposits"].as_array().unwrap().is_empty());
+}
+
+// ---- Matching, buys and Solana ----
+
+#[test]
+fn hashes_match_however_they_are_written() {
+    assert_eq!(pending::norm_hash("0xABCdef"), "abcdef");
+    assert_eq!(pending::norm_hash("  abcDEF "), "abcdef");
+}
+
+#[sqlx::test]
+async fn a_credited_payment_stops_showing_as_arriving_even_when_its_hash_is_written_differently(pool: PgPool) {
+    stablecoin(&pool).await;
+    let user = seed_user(&pool).await;
+    wallet(&pool, user).await;
+    pending::record_pending(&pool, &[transfer(WALLET, USDC_CONTRACT, "ABC123")]).await.unwrap();
+    assert_eq!(pending::pending_for(&pool, user).await.unwrap()["deposits"].as_array().unwrap().len(), 1);
+
+    let deposit = seed_deposit(&pool, user, 5_000_000, "0 seconds").await;
+    sqlx::query("UPDATE deposits SET tx_hash = 'someone-elses-spelling' WHERE id = $1").bind(deposit).execute(&pool).await.unwrap();
+    let view = pending::pending_for(&pool, user).await.unwrap();
+    assert!(view["deposits"].as_array().unwrap().is_empty(), "the same amount credited right after is the same payment");
+
+    let again = pending::record_pending(&pool, &[transfer(WALLET, USDC_CONTRACT, "abc123")]).await.unwrap();
+    assert_eq!(again, 0, "a repeat alert after the credit does not bring it back");
+}
+
+#[sqlx::test]
+async fn recording_a_deposit_clears_the_matching_arrival_and_leaves_other_amounts_alone(pool: PgPool) {
+    let user = seed_user(&pool).await;
+    sqlx::query("INSERT INTO pending_deposits (user_id, tx_hash, asset, amount_micros) VALUES ($1, 'aaa', 'USDC', 5000000), ($1, 'bbb', 'USDC', 9000000)")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    pending::settle(&pool, user, "usdc", 5_000_000).await.unwrap();
+    let left: Vec<String> = sqlx::query_scalar("SELECT tx_hash FROM pending_deposits").fetch_all(&pool).await.unwrap();
+    assert_eq!(left, vec!["bbb".to_string()]);
+}
+
+#[sqlx::test]
+async fn an_arrival_the_gateway_keeps_listing_stays_while_an_old_alert_only_row_expires(pool: PgPool) {
+    let user = seed_user(&pool).await;
+    sqlx::query("INSERT INTO pending_deposits (user_id, tx_hash, asset, amount_micros, seen_at) VALUES ($1, 'stale', 'USDC', 1000000, now() - interval '2 hours')")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(pending::pending_for(&pool, user).await.unwrap()["deposits"].as_array().unwrap().is_empty());
+
+    pending::note_gateway_pending(&pool, user, "0xStale", "USDC", 1_000_000).await.unwrap();
+    assert_eq!(pending::pending_for(&pool, user).await.unwrap()["deposits"].as_array().unwrap().len(), 1, "listed again by the gateway, so shown");
+}
+
+#[sqlx::test]
+async fn a_finished_sale_stays_listed_for_a_few_minutes_and_then_goes_so_the_button_does_not_flicker(pool: PgPool) {
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    sqlx::query("INSERT INTO orders (user_id, kind, side, asset_key, amount_micros, qty_base, status) VALUES ($1, 'manual', 'sell', 'spy-id', 9000000, '0.5', 'completed')")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let view = pending::pending_for(&pool, user).await.unwrap();
+    assert_eq!((view["sales"][0]["asset_key"].as_str(), view["sales"][0]["done"].as_bool()), (Some("spy-id"), Some(true)));
+
+    sqlx::query("UPDATE orders SET updated_at = now() - interval '20 minutes'").execute(&pool).await.unwrap();
+    assert!(pending::pending_for(&pool, user).await.unwrap()["sales"].as_array().unwrap().is_empty());
+}
+
+#[sqlx::test]
+async fn manual_buys_are_listed_while_settling_but_automatic_ones_are_not(pool: PgPool) {
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    for (kind, status) in [("manual", "awaiting_settlement"), ("auto", "awaiting_settlement"), ("manual", "failed")] {
+        sqlx::query("INSERT INTO orders (user_id, kind, side, asset_key, amount_micros, status) VALUES ($1, $2, 'buy', 'qqq-id', 2000000, $3)")
+            .bind(user)
+            .bind(kind)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let view = pending::pending_for(&pool, user).await.unwrap();
+    let buys = view["buys"].as_array().unwrap();
+    assert_eq!(buys.len(), 1);
+    assert_eq!((buys[0]["asset_key"].as_str(), buys[0]["done"].as_bool(), buys[0]["amount_usd"].as_str()), (Some("qqq-id"), Some(false), Some("2.00")));
+}
+
+fn solana_tx(owner: &str, mint: &str, before: &str, after: &str) -> serde_json::Value {
+    json!({ "result": { "meta": {
+        "preTokenBalances": [{ "owner": owner, "mint": mint, "uiTokenAmount": { "amount": before, "decimals": 6 } }],
+        "postTokenBalances": [{ "owner": owner, "mint": mint, "uiTokenAmount": { "amount": after, "decimals": 6 } },
+                              { "owner": "someone-else", "mint": mint, "uiTokenAmount": { "amount": "1000000", "decimals": 6 } }]
+    }}})
+}
+
+#[test]
+fn a_solana_transaction_yields_only_the_balances_that_grew() {
+    let found = crate::services::chain_watch::solana_transfers(&solana_tx("OWNER", "MINT", "2000000", "7000000"));
+    assert_eq!(found.len(), 2, "the new balance of someone else counts as a gain from zero, and is matched to users later");
+    assert_eq!((found[0].owner.as_str(), found[0].micros), ("OWNER", 5_000_000));
+    let none = crate::services::chain_watch::solana_transfers(&solana_tx("OWNER", "MINT", "7000000", "2000000"));
+    assert!(none.iter().all(|t| t.owner != "OWNER"), "a balance that fell is not a deposit");
+
+    let long = "5j7s6NiJS3JAkvgkoc18WVAsiSaci2pxB2A6ueCJP4tprA2TFg9wSyTLeYouxPBJEMzJinENTkpA52YStRW5Dia7";
+    let sigs = crate::services::chain_watch::solana_signatures(&json!({ "event": { "x": [long, "short", "0xabc"] } }));
+    assert_eq!(sigs, vec![long.to_string()]);
+}
+
+#[sqlx::test]
+async fn a_solana_alert_shows_the_payment_as_arriving_after_reading_it_from_the_chain(pool: PgPool) {
+    sqlx::query("INSERT INTO assets (asset_key, symbol, name, chain, address, tradable, stable) VALUES ('pyusd-sol', 'PYUSD', 'PayPal USD', 'solana', 'MINT', false, true)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mock = Mock::new("complete");
+    let mut st = state(&pool, &mock, true).await;
+    with_alchemy(&mut st);
+    let user = seed_user(&pool).await;
+    sqlx::query("INSERT INTO wallets (user_id, address, network) VALUES ($1, 'OWNER', 'solana')").bind(user).execute(&pool).await.unwrap();
+    *mock.solana_tx.lock().unwrap() = solana_tx("OWNER", "MINT", "0", "12000000");
+
+    let signature = "5j7s6NiJS3JAkvgkoc18WVAsiSaci2pxB2A6ueCJP4tprA2TFg9wSyTLeYouxPBJEMzJinENTkpA52YStRW5Dia7";
+    let noted = crate::services::chain_watch::note_solana(&st, signature).await.unwrap();
+    assert_eq!(noted, 1);
+
+    let view = pending::pending_for(&pool, user).await.unwrap();
+    assert_eq!((view["deposits"][0]["asset"].as_str(), view["deposits"][0]["amount_usd"].as_str()), (Some("PYUSD"), Some("12.00")));
+
+    let again = crate::services::chain_watch::note_solana(&st, signature).await.unwrap();
+    assert_eq!(again, 0, "the same signature is noted once");
 }
