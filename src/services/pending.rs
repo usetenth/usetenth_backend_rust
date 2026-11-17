@@ -4,8 +4,12 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-// A payment this long in the arriving list without being credited is dropped from it.
-const ARRIVING_MINUTES: i64 = 30;
+// A payment seen only on the chain and not confirmed by the gateway is dropped from the arriving list after this long.
+const ARRIVING_MINUTES: i64 = 6;
+// An order this old and still unsettled needs a person, so it is no longer shown as in progress.
+const ORDER_SHOWN_MINUTES: i64 = 15;
+// Trades this recent explain stablecoins landing in the wallet, such as sale proceeds, which are not payments.
+const TRADE_QUIET_MINUTES: i64 = 5;
 // A sale or buy that finished this recently still counts until the balances catch up.
 const SETTLED_MINUTES: i64 = 5;
 // The same credited payment is recognised by amount for this long after it is seen.
@@ -63,10 +67,24 @@ async fn credited(pool: &PgPool, user_id: Uuid, hash: &str, asset: &str, micros:
     .await
 }
 
-/// Notes an incoming stablecoin transfer so the app can show it before the gateway credits it.
+// True while the user has an order moving or one that finished a moment ago.
+async fn trading_now(pool: &PgPool, user_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM orders WHERE user_id = $1 AND (
+             status IN ('pending', 'processing', 'submitted', 'awaiting_settlement')
+          OR updated_at > now() - ($2::BIGINT * interval '1 minute')))",
+    )
+    .bind(user_id)
+    .bind(TRADE_QUIET_MINUTES)
+    .fetch_one(pool)
+    .await
+}
+
+/// Notes an incoming stablecoin transfer seen on the chain so the app can show it before the gateway credits it.
+/// Skipped while the user is trading, because sale proceeds and change from their own orders land the same way.
 pub async fn note(pool: &PgPool, user_id: Uuid, hash: &str, symbol: &str, micros: Option<i64>) -> sqlx::Result<bool> {
     let hash = norm_hash(hash);
-    if credited(pool, user_id, &hash, symbol, micros).await? {
+    if credited(pool, user_id, &hash, symbol, micros).await? || trading_now(pool, user_id).await? {
         return Ok(false);
     }
     let result = sqlx::query(
@@ -150,7 +168,8 @@ async fn trades(pool: &PgPool, user_id: Uuid, side: &str, manual_only: bool) -> 
         "SELECT o.id, o.asset_key, a.symbol, o.qty_base, o.amount_micros, o.created_at, o.status = 'completed' FROM orders o
          LEFT JOIN assets a ON a.asset_key = o.asset_key
          WHERE o.user_id = $1 AND o.side = $2 AND ($3 = false OR o.kind = 'manual')
-           AND (o.status IN ('pending', 'processing', 'submitted', 'awaiting_settlement')
+           AND ((o.status IN ('pending', 'processing', 'submitted', 'awaiting_settlement')
+                 AND o.created_at > now() - ($5::BIGINT * interval '1 minute'))
                 OR (o.status = 'completed' AND o.updated_at > now() - ($4::BIGINT * interval '1 minute')))
          ORDER BY o.created_at DESC LIMIT 10",
     )
@@ -158,6 +177,7 @@ async fn trades(pool: &PgPool, user_id: Uuid, side: &str, manual_only: bool) -> 
     .bind(side)
     .bind(manual_only)
     .bind(SETTLED_MINUTES)
+    .bind(ORDER_SHOWN_MINUTES)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(trade_json).collect())

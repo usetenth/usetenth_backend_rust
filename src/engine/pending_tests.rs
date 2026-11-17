@@ -318,3 +318,50 @@ async fn a_solana_alert_shows_the_payment_as_arriving_after_reading_it_from_the_
     let again = crate::services::chain_watch::note_solana(&st, signature).await.unwrap();
     assert_eq!(again, 0, "the same signature is noted once");
 }
+
+// ---- Not mistaking a user's own trades for payments ----
+
+#[sqlx::test]
+async fn stablecoins_landing_while_the_user_is_trading_are_not_shown_as_a_payment(pool: PgPool) {
+    stablecoin(&pool).await;
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    wallet(&pool, user).await;
+    sqlx::query("INSERT INTO orders (user_id, kind, side, asset_key, amount_micros, qty_base, status) VALUES ($1, 'manual', 'sell', 'spy-id', 2150000, '0.01', 'awaiting_settlement')")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let noted = pending::record_pending(&pool, &[transfer(WALLET, USDC_CONTRACT, "0xproceeds")]).await.unwrap();
+    assert_eq!(noted, 0, "sale proceeds are not a payment");
+
+    sqlx::query("UPDATE orders SET status = 'completed', updated_at = now() - interval '20 minutes'").execute(&pool).await.unwrap();
+    let noted = pending::record_pending(&pool, &[transfer(WALLET, USDC_CONTRACT, "0xrealdeposit")]).await.unwrap();
+    assert_eq!(noted, 1, "with no recent trading, an incoming payment is shown");
+}
+
+#[sqlx::test]
+async fn an_alert_only_arrival_the_gateway_never_confirms_disappears_after_a_few_minutes(pool: PgPool) {
+    let user = seed_user(&pool).await;
+    sqlx::query("INSERT INTO pending_deposits (user_id, tx_hash, asset, amount_micros, seen_at) VALUES ($1, 'fresh', 'USDC', 1000000, now() - interval '2 minutes'), ($1, 'old', 'USDC', 2000000, now() - interval '10 minutes')")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let view = pending::pending_for(&pool, user).await.unwrap();
+    let shown: Vec<&str> = view["deposits"].as_array().unwrap().iter().filter_map(|d| d["id"].as_str()).collect();
+    assert_eq!(shown, vec!["fresh"]);
+}
+
+#[sqlx::test]
+async fn an_order_stuck_for_a_quarter_of_an_hour_is_no_longer_shown_as_in_progress(pool: PgPool) {
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    sqlx::query("INSERT INTO orders (user_id, kind, side, asset_key, amount_micros, qty_base, status, created_at) VALUES ($1, 'manual', 'sell', 'spy-id', 9000000, '0.5', 'awaiting_settlement', now() - interval '30 minutes')")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(pending::pending_for(&pool, user).await.unwrap()["sales"].as_array().unwrap().is_empty());
+}

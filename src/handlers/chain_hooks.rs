@@ -78,7 +78,8 @@ pub async fn alchemy(State(state): State<ApplicationState>, headers: HeaderMap, 
                 if transfers.is_empty() {
                     // Solana alerts only name the transaction, so its amount is read from the chain.
                     let signatures = chain_watch::solana_signatures(&payload);
-                    if signatures.is_empty() {
+                    // Only an alert of an unknown shape is worth logging; ETH moves in the usual shape are not.
+                    if signatures.is_empty() && payload.pointer("/event/activity").is_none() {
                         println!("Chain alert payload: {}", body_preview(&body));
                     }
                     for signature in signatures.into_iter().take(5) {
