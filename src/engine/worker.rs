@@ -597,12 +597,10 @@ pub async fn recover_stale(state: &ApplicationState) -> anyhow::Result<()> {
                 Outcome::Done | Outcome::InFlight => set_status(pool, id, "awaiting_settlement", None).await?,
                 Outcome::Failed => {
                     // The status call carries no reason, so the order's own record is asked for it.
-                    let reason = match state.tm_client.get_order(&gateway_user, &gateway_order_id).await {
-                        Ok(detail) => detail.failure_reason,
-                        Err(_) => None,
-                    }
-                    .unwrap_or_else(|| "gateway reported the order failed".into());
-                    eprintln!("Order {id} failed at the gateway: {reason}");
+                    let detail = state.tm_client.get_order(&gateway_user, &gateway_order_id).await.ok();
+                    let reason = detail.as_ref().and_then(|d| d.failure_reason.clone()).unwrap_or_else(|| "gateway reported the order failed".into());
+                    // The whole record is logged: what was executed, any fee and any transaction are the evidence if money is missing.
+                    eprintln!("Order {id} failed at the gateway ({gateway_order_id}): {reason}. Gateway record: {detail:?}");
                     fail_or_retry(pool, id, &kind, attempts, &reason).await?
                 }
                 Outcome::NotExecuted if !old_enough => {}
@@ -670,7 +668,8 @@ pub async fn reconcile(state: &ApplicationState) -> anyhow::Result<()> {
                         .await?;
                 }
                 Outcome::Failed => {
-                    let reason = detail.failure_reason.unwrap_or_else(|| "gateway reported the order failed".into());
+                    let reason = detail.failure_reason.clone().unwrap_or_else(|| "gateway reported the order failed".into());
+                    eprintln!("Order {id} failed at the gateway ({gateway_order_id}): {reason}. Gateway record: {detail:?}");
                     fail_or_retry(pool, id, &kind, attempts, &reason).await?;
                 }
                 Outcome::InFlight | Outcome::NotExecuted => {}
