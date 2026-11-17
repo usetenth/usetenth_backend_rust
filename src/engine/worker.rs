@@ -16,8 +16,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const MAX_ATTEMPTS: i32 = 5;
-// After a chain hint the gateway is asked again at these delays, because it may credit the money a little later.
-const HINT_DELAYS_SECS: [u64; 6] = [0, 5, 15, 45, 120, 300];
+// How long a new order counts as recent work, keeping the engine on its fast pace.
+const FAST_LANE_WINDOW: &str = "10 minutes";
 static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 // An order stuck mid-flight this long is resolved by asking the gateway what happened.
 const STALE_SECS: i64 = 300;
@@ -31,12 +31,36 @@ pub async fn run(state: ApplicationState) {
     }
     loop {
         tick(&state).await;
+        // Fresh orders are checked every few seconds; with nothing in flight the engine rests for the normal poll.
+        let busy = has_recent_work(&state.pool).await.unwrap_or(false);
+        let wait = if busy { cfg.fast_poll_secs.min(cfg.poll_secs) } else { cfg.poll_secs };
         // A newly found deposit wakes the engine so it is invested without waiting for the next poll.
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(cfg.poll_secs)) => {}
+            _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
             _ = WAKE.notified() => {}
         }
     }
+}
+
+/// True while any recent order or withdrawal is still moving, so its result is picked up within seconds.
+pub(crate) async fn has_recent_work(pool: &PgPool) -> sqlx::Result<bool> {
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM orders WHERE status IN ('pending', 'processing', 'submitted', 'awaiting_settlement')
+                        AND created_at > now() - interval '{FAST_LANE_WINDOW}')
+             OR EXISTS (SELECT 1 FROM withdrawals WHERE status IN ('pending', 'processing', 'submitted', 'awaiting_settlement')
+                        AND created_at > now() - interval '{FAST_LANE_WINDOW}')"
+    ))
+    .fetch_one(pool)
+    .await
+}
+
+/// Waits between lookups after a chain alert: every 5 s for a minute, every 10 s for two more, then every 30 s up to ten minutes.
+pub(crate) fn hint_delays() -> Vec<u64> {
+    std::iter::once(0)
+        .chain(std::iter::repeat_n(5, 12))
+        .chain(std::iter::repeat_n(10, 12))
+        .chain(std::iter::repeat_n(30, 14))
+        .collect()
 }
 
 fn log<T>(result: anyhow::Result<T>, stage: &str) {
@@ -52,6 +76,8 @@ pub async fn tick(state: &ApplicationState) {
     log(crate::services::chain_watch::sync_addresses(state).await, "watch addresses");
     log(detect_deposits(state).await, "detect deposits");
     log(plan_investments(&state.pool, cfg).await, "plan investments");
+    // The payment notice goes out before any order is placed, so the user hears about it first.
+    log(notify_deposits(state).await, "notify deposits");
     log(recover_stale(state).await, "recover stale orders");
     log(execute_pending(state).await, "execute orders");
     log(super::withdrawals::recover_stale(state).await, "recover stale withdrawals");
@@ -60,7 +86,6 @@ pub async fn tick(state: &ApplicationState) {
     log(super::withdrawals::notify(state).await, "notify withdrawals");
     log(reconcile(state).await, "reconcile orders");
     log(finalize_investments(&state.pool).await, "finalize investments");
-    log(notify_deposits(state).await, "notify deposits");
     log(notify_users(state).await, "notify users");
 }
 
@@ -107,7 +132,7 @@ pub async fn detect_deposits(state: &ApplicationState) -> anyhow::Result<()> {
 }
 
 // The check is recorded only when it worked, so a failing lookup is retried on the next pass.
-async fn check_one(state: &ApplicationState, user_id: Uuid, gateway_id: &str) -> anyhow::Result<usize> {
+async fn check_one(state: &ApplicationState, user_id: Uuid, gateway_id: &str) -> anyhow::Result<(usize, usize)> {
     let found = detect_for_user(state, user_id, gateway_id).await?;
     sqlx::query(
         "INSERT INTO deposit_checks (user_id, last_checked_at) VALUES ($1, now())
@@ -119,8 +144,8 @@ async fn check_one(state: &ApplicationState, user_id: Uuid, gateway_id: &str) ->
     Ok(found)
 }
 
-/// Looks up one user's incoming payments now; returns how many new deposits were recorded.
-pub async fn check_user(state: &ApplicationState, user_id: Uuid) -> anyhow::Result<usize> {
+/// Looks up one user's incoming payments now; returns (new deposits recorded, incoming transfers not completed yet).
+pub async fn check_user(state: &ApplicationState, user_id: Uuid) -> anyhow::Result<(usize, usize)> {
     let gateway: Option<String> = sqlx::query_scalar::<_, Option<String>>("SELECT gateway_user_id FROM users WHERE id = $1 AND verified = 'verified'")
         .bind(user_id)
         .fetch_optional(&state.pool)
@@ -128,7 +153,7 @@ pub async fn check_user(state: &ApplicationState, user_id: Uuid) -> anyhow::Resu
         .flatten();
     match gateway {
         Some(gateway_id) => check_one(state, user_id, &gateway_id).await,
-        None => Ok(0),
+        None => Ok((0, 0)),
     }
 }
 
@@ -143,20 +168,28 @@ pub fn hint_user(state: ApplicationState, user_id: Uuid) {
         return;
     }
     tokio::spawn(async move {
-        hint_checks(&state, user_id, &HINT_DELAYS_SECS).await;
+        hint_checks(&state, user_id, &hint_delays()).await;
         hints_running().lock().unwrap().remove(&user_id);
     });
 }
 
 pub(crate) async fn hint_checks(state: &ApplicationState, user_id: Uuid, delays: &[u64]) {
+    let started = std::time::Instant::now();
+    let mut said_pending = false;
     for delay in delays {
         tokio::time::sleep(Duration::from_secs(*delay)).await;
         match check_user(state, user_id).await {
-            Ok(found) if found > 0 => {
+            Ok((recorded, _)) if recorded > 0 => {
+                println!("Chain alert: {recorded} new deposit(s) recorded for user {user_id} {}s after the alert", started.elapsed().as_secs());
                 WAKE.notify_one();
                 return;
             }
-            Ok(_) => {}
+            Ok((_, pending)) => {
+                if pending > 0 && !said_pending {
+                    said_pending = true;
+                    println!("Chain alert: user {user_id} has {pending} incoming transfer(s) the gateway has not marked completed yet ({}s after the alert)", started.elapsed().as_secs());
+                }
+            }
             Err(error) => eprintln!("Deposit check after a chain hint failed for user {user_id}: {error:#}"),
         }
     }
@@ -171,13 +204,16 @@ fn warn_once_ignored(source_id: &str, symbol: &str, settlement: &[String]) {
     }
 }
 
-async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &str) -> anyhow::Result<usize> {
+async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &str) -> anyhow::Result<(usize, usize)> {
     // Any stablecoin the gateway lists counts, not only the settlement asset, because the gateway credits all of them.
     let mut symbols = state.config.engine.settlement_symbols.clone();
     symbols.extend(crate::services::catalog::stable_symbols(&state.pool).await?);
     let response = state.tm_client.list_transactions(gateway_id).await?;
-    let mut recorded = 0;
+    let (mut recorded, mut pending) = (0, 0);
     for tx in response.data {
+        if tx.transaction_type == Some(TransactionType::ReceivedTransfer) && tx.status == Some(TransactionStatus::Pending) {
+            pending += 1;
+        }
         let (Some(TransactionType::ReceivedTransfer), Some(TransactionStatus::Completed), Some(received)) =
             (tx.transaction_type, tx.status, tx.received_transfer)
         else {
@@ -204,7 +240,7 @@ async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &s
         .await?;
         recorded += inserted.rows_affected() as usize;
     }
-    Ok(recorded)
+    Ok((recorded, pending))
 }
 
 

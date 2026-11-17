@@ -110,6 +110,8 @@ pub struct EngineConfig {
     // When true the engine plans orders but never calls the gateway to place or sign them.
     pub dry_run: bool,
     pub poll_secs: u64,
+    // The pace while a recent order is still in flight, so its result shows up within seconds.
+    pub fast_poll_secs: u64,
     // A user's incoming payments are looked up at least this often; webhooks make it faster, so this can be long.
     pub deposit_backstop_secs: u64,
     // Symbols of the stablecoins whose incoming transfers count as deposits.
@@ -215,6 +217,7 @@ impl EngineConfig {
             // Safe by default: nothing trades until DRY_RUN=false is set deliberately.
             dry_run: flag("DRY_RUN", true),
             poll_secs: std::env::var("ENGINE_POLL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+            fast_poll_secs: std::env::var("ENGINE_FAST_POLL_SECS").ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(3),
             deposit_backstop_secs: std::env::var("DEPOSIT_BACKSTOP_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
             settlement_symbols: std::env::var("TM_SETTLEMENT_ASSET")
                 .unwrap_or_else(|_| "USDC".into())
@@ -352,6 +355,7 @@ impl EngineConfig {
             enabled: true,
             dry_run,
             poll_secs: 1,
+            fast_poll_secs: 1,
             deposit_backstop_secs: 0,
             settlement_symbols: vec!["USDC".into()],
             global_floor_micros: 1_000_000,

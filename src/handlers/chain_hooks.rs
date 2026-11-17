@@ -68,6 +68,9 @@ pub async fn alchemy(State(state): State<ApplicationState>, headers: HeaderMap, 
     let (evm, other) = candidate_addresses(&payload);
     match users_for(&state.pool, &evm, &other).await {
         Ok(users) => {
+            if !users.is_empty() {
+                println!("Chain alert matched {} user(s)", users.len());
+            }
             for user in users {
                 worker::hint_user(state.clone(), user);
             }

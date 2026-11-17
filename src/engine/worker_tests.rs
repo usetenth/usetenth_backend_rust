@@ -50,6 +50,8 @@ pub(crate) struct Mock {
     // (token header, body) of every request to the webhook provider's address API.
     pub(crate) alchemy: Arc<Mutex<Vec<(String, Value)>>>,
     pub(crate) alchemy_down: Arc<AtomicBool>,
+    // How many Telegram messages had been sent when the first order was created.
+    pub(crate) first_create_messages: Arc<Mutex<Option<usize>>>,
 }
 
 impl Mock {
@@ -84,6 +86,7 @@ impl Mock {
             transaction_calls: Default::default(),
             alchemy: Default::default(),
             alchemy_down: Default::default(),
+            first_create_messages: Default::default(),
         }
     }
     pub(crate) fn creates(&self) -> usize {
@@ -124,6 +127,8 @@ async fn serve(mock: Mock) -> String {
     }
     async fn create(State(m): State<Mock>, Json(body): Json<Value>) -> Json<Value> {
         let n = m.creates.fetch_add(1, Ordering::SeqCst);
+        let sent = m.telegram.lock().unwrap().len();
+        m.first_create_messages.lock().unwrap().get_or_insert(sent);
         let is_sell = body["side"] == "sell";
         *m.last_order.lock().unwrap() = body;
         let order_id = format!("go-{n}-{}", Uuid::new_v4());

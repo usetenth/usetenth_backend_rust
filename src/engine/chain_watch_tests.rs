@@ -1,5 +1,5 @@
 use super::worker::*;
-use crate::engine::worker_tests::{Mock, received, seed_user, state, with_alchemy};
+use crate::engine::worker_tests::{Mock, received, seed_assets, seed_deposit, seed_user, state, with_alchemy};
 use crate::handlers::chain_hooks;
 use crate::services::chain_watch::sync_addresses;
 use axum::{
@@ -240,4 +240,68 @@ async fn without_the_provider_configured_nothing_is_sent(pool: PgPool) {
 
     sync_addresses(&st).await.unwrap();
     assert!(mock.alchemy.lock().unwrap().is_empty());
+}
+
+// ---- Speed ----
+
+#[test]
+fn the_retry_schedule_is_dense_at_first_and_ends_after_ten_minutes() {
+    let delays = hint_delays();
+    assert_eq!(delays[0], 0, "the first look is immediate");
+    assert_eq!(delays.iter().take(13).sum::<u64>(), 60, "twelve looks in the first minute");
+    assert!(delays.iter().all(|d| *d <= 30), "never a long gap");
+    assert_eq!(delays.iter().sum::<u64>(), 600);
+}
+
+#[sqlx::test]
+async fn a_transfer_the_gateway_has_not_completed_yet_is_counted_but_not_recorded(pool: PgPool) {
+    let mock = Mock::new("complete");
+    let st = state(&pool, &mock, true).await;
+    let user = seed_user(&pool).await;
+    let mut transfer = received("USDC", "10");
+    transfer["status"] = "pending".into();
+    *mock.transactions.lock().unwrap() = vec![transfer.clone()];
+
+    assert_eq!(check_user(&st, user).await.unwrap(), (0, 1));
+    assert_eq!(deposits(&pool).await, 0);
+
+    transfer["status"] = "completed".into();
+    *mock.transactions.lock().unwrap() = vec![transfer];
+    assert_eq!(check_user(&st, user).await.unwrap(), (1, 0));
+    assert_eq!(deposits(&pool).await, 1);
+}
+
+#[sqlx::test]
+async fn the_engine_stays_on_its_fast_pace_only_while_a_recent_order_is_in_flight(pool: PgPool) {
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    assert!(!has_recent_work(&pool).await.unwrap(), "nothing running");
+
+    sqlx::query("INSERT INTO orders (user_id, kind, asset_key, amount_micros, status) VALUES ($1, 'auto', 'spy-id', 1000000, 'awaiting_settlement')")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(has_recent_work(&pool).await.unwrap());
+
+    sqlx::query("UPDATE orders SET created_at = now() - interval '30 minutes'").execute(&pool).await.unwrap();
+    assert!(!has_recent_work(&pool).await.unwrap(), "an old open order does not keep it busy");
+
+    sqlx::query("UPDATE orders SET created_at = now(), status = 'completed'").execute(&pool).await.unwrap();
+    assert!(!has_recent_work(&pool).await.unwrap(), "a finished order does not either");
+}
+
+#[sqlx::test]
+async fn the_payment_notice_goes_out_before_the_first_order_is_placed(pool: PgPool) {
+    seed_assets(&pool).await;
+    let user = seed_user(&pool).await;
+    seed_deposit(&pool, user, 100_000_000, "1 hour").await;
+    let mock = Mock::new("complete");
+    let st = state(&pool, &mock, false).await;
+    st.signing.ensure_user_key(user).await.unwrap();
+
+    tick(&st).await;
+
+    let sent_before_first_order = mock.first_create_messages.lock().unwrap().expect("an order was placed");
+    assert!(sent_before_first_order >= 1, "the user had already been told about the payment");
 }
