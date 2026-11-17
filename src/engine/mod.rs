@@ -17,3 +17,6 @@ mod notify_tests;
 
 #[cfg(test)]
 mod chain_watch_tests;
+
+#[cfg(test)]
+mod pending_tests;

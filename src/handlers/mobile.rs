@@ -246,6 +246,12 @@ pub async fn portfolio(State(state): State<ApplicationState>, AuthUser(user_id):
     Ok(ApiResponse::ok("Portfolio", portfolio))
 }
 
+// Payments still arriving or being invested and sales still settling, so nothing looks stuck.
+pub async fn pending(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser) -> ApiResult<Value> {
+    active_gateway_user(&state, user_id).await?;
+    Ok(ApiResponse::ok("Pending", crate::services::pending::pending_for(&state.pool, user_id).await?))
+}
+
 pub async fn deposit(State(state): State<ApplicationState>, AuthUser(user_id): AuthUser) -> ApiResult<BotDeposit> {
     active_gateway_user(&state, user_id).await?;
     match bot_data::deposit_for_user(&state, user_id).await.map_err(internal)? {

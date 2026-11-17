@@ -173,7 +173,7 @@ All replies look like `{ "success": true, "message": "...", "data": ... }`.
 | Chain alerts | `POST /hooks/alchemy` (signed by Alchemy; off until its signing keys are set) |
 | Accounts | `POST /auth/register`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/credentials`, `/auth/telegram/login`, `/auth/telegram/webapp`, `/auth/telegram/link`, `GET /auth/me` |
 | Setup | `GET /v1/onboarding`, `POST /v1/onboarding/advance`, `/v1/kyc`, `/v1/rule`, `/v1/rule/custom`, `/v1/plans`, `/v1/assets` |
-| Money in | `GET /v1/deposit`, `/v1/portfolio`, `/v1/investments` |
+| Money in | `GET /v1/deposit`, `/v1/portfolio`, `/v1/investments`, `/v1/pending` (payments arriving or being invested, and sales still settling) |
 | Trading | `POST /v1/trades/quote`, `POST /v1/trades`, `GET /v1/orders`, `/v1/orders/{id}`, `/v1/holdings`, `POST /v1/sells/quote`, `POST /v1/sells` |
 | Money out | `POST /v1/confirm`, `GET /v1/withdraw/assets`, `/v1/withdraw/addresses`, `/v1/withdrawals`, and the matching `POST` and `DELETE` routes |
 | Operator | `POST /admin/assets/sync`, `PUT /admin/plans/{plan}/allocations`, `GET /admin/orders/review`, `POST /admin/orders/{id}/resolve`, `GET /admin/kyc/review`, `POST /admin/kyc/{id}/resolve` |

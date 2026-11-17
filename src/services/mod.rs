@@ -14,6 +14,7 @@ pub mod name_match;
 pub mod quotes;
 pub mod notify;
 pub mod chain_watch;
+pub mod pending;
 
 #[cfg(test)]
 mod service_tests;

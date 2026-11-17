@@ -1,4 +1,4 @@
-use crate::{app_state::ApplicationState, engine::worker};
+use crate::{app_state::ApplicationState, engine::worker, services::pending};
 use axum::{
     body::Bytes,
     extract::State,
@@ -47,6 +47,10 @@ pub fn candidate_addresses(payload: &Value) -> (Vec<String>, Vec<String>) {
     (evm, other)
 }
 
+fn body_preview(body: &[u8]) -> String {
+    String::from_utf8_lossy(body).chars().take(1500).collect()
+}
+
 async fn users_for(pool: &PgPool, evm: &[String], other: &[String]) -> sqlx::Result<Vec<Uuid>> {
     sqlx::query_scalar("SELECT DISTINCT user_id FROM wallets WHERE lower(address) = ANY($1) OR address = ANY($2)")
         .bind(evm)
@@ -70,6 +74,13 @@ pub async fn alchemy(State(state): State<ApplicationState>, headers: HeaderMap, 
         Ok(users) => {
             if !users.is_empty() {
                 println!("Chain alert matched {} user(s)", users.len());
+                let transfers = pending::evm_transfers(&payload);
+                if transfers.is_empty() {
+                    // The shape of non-EVM alerts is not known yet, so the first part of each is logged to learn it.
+                    println!("Chain alert payload: {}", body_preview(&body));
+                } else if let Err(error) = pending::record_pending(&state.pool, &transfers).await {
+                    eprintln!("Could not note the incoming transfer: {error:#}");
+                }
             }
             for user in users {
                 worker::hint_user(state.clone(), user);

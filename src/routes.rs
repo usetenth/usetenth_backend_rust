@@ -37,6 +37,7 @@ pub fn app_router(state: ApplicationState) -> Router {
         .route("/assets", get(mobile::list_assets))
         .route("/portfolio", get(mobile::portfolio))
         .route("/deposit", get(mobile::deposit))
+        .route("/pending", get(mobile::pending))
         .route("/notifications", get(mobile::notifications))
         .route("/notifications/read", post(mobile::notifications_read))
         .route("/investments", get(mobile::list_investments))

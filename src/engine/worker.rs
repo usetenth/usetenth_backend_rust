@@ -213,6 +213,13 @@ async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &s
     for tx in response.data {
         if tx.transaction_type == Some(TransactionType::ReceivedTransfer) && tx.status == Some(TransactionStatus::Pending) {
             pending += 1;
+            // Shown in the app as arriving until the gateway completes it.
+            if let Some(received) = &tx.received_transfer {
+                let symbol = received.token_symbol.to_uppercase();
+                if let Some(micros) = parse_micros(&received.amount).filter(|m| *m > 0).filter(|_| symbols.contains(&symbol)) {
+                    crate::services::pending::note_gateway_pending(&state.pool, user_id, &received.tx_hash, &symbol, micros).await?;
+                }
+            }
         }
         let (Some(TransactionType::ReceivedTransfer), Some(TransactionStatus::Completed), Some(received)) =
             (tx.transaction_type, tx.status, tx.received_transfer)
@@ -239,6 +246,7 @@ async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &s
         .execute(&state.pool)
         .await?;
         recorded += inserted.rows_affected() as usize;
+        crate::services::pending::clear(&state.pool, user_id, &received.tx_hash).await?;
     }
     Ok((recorded, pending))
 }
