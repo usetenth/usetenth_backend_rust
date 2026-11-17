@@ -58,6 +58,50 @@ pub struct AppConfig {
     pub kyc: KycConfig,
     // Guards /admin. Unset disables the admin API entirely.
     pub admin_api_key: Option<String>,
+    // Unset means deposits are found by polling alone.
+    pub alchemy: Option<AlchemyConfig>,
+}
+
+#[derive(Clone)]
+pub struct AlchemyConfig {
+    pub api_base: String,
+    // Lets the server add wallet addresses to the webhooks; without it, addresses are added by hand in the dashboard.
+    pub auth_token: Option<String>,
+    // (network, webhook id) pairs, network being "evm" or "solana".
+    pub webhooks: Vec<(String, String)>,
+    pub signing_keys: Vec<String>,
+}
+
+impl AlchemyConfig {
+    fn from_env() -> Option<Self> {
+        let list = |name: &str| -> Vec<String> {
+            std::env::var(name).unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        };
+        let signing_keys = list("ALCHEMY_WEBHOOK_SIGNING_KEYS");
+        let mut webhooks = vec![];
+        for pair in list("ALCHEMY_WEBHOOK_IDS") {
+            match pair.split_once(':') {
+                Some((network, id)) if matches!(network.trim().to_lowercase().as_str(), "evm" | "solana") && !id.trim().is_empty() => {
+                    webhooks.push((network.trim().to_lowercase(), id.trim().to_string()));
+                }
+                _ => eprintln!("Ignoring ALCHEMY_WEBHOOK_IDS entry '{pair}': expected evm:<id> or solana:<id>"),
+            }
+        }
+        if signing_keys.is_empty() && webhooks.is_empty() {
+            return None;
+        }
+        Some(Self {
+            api_base: std::env::var("ALCHEMY_API_BASE")
+                .ok()
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| "https://dashboard.alchemy.com/api".into())
+                .trim_end_matches('/')
+                .to_string(),
+            auth_token: std::env::var("ALCHEMY_AUTH_TOKEN").ok().filter(|t| !t.trim().is_empty()),
+            webhooks,
+            signing_keys,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +110,8 @@ pub struct EngineConfig {
     // When true the engine plans orders but never calls the gateway to place or sign them.
     pub dry_run: bool,
     pub poll_secs: u64,
+    // A user's incoming payments are looked up at least this often; webhooks make it faster, so this can be long.
+    pub deposit_backstop_secs: u64,
     // Symbols of the stablecoins whose incoming transfers count as deposits.
     pub settlement_symbols: Vec<String>,
     // Investments and order legs below this are not worth placing.
@@ -169,6 +215,7 @@ impl EngineConfig {
             // Safe by default: nothing trades until DRY_RUN=false is set deliberately.
             dry_run: flag("DRY_RUN", true),
             poll_secs: std::env::var("ENGINE_POLL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+            deposit_backstop_secs: std::env::var("DEPOSIT_BACKSTOP_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
             settlement_symbols: std::env::var("TM_SETTLEMENT_ASSET")
                 .unwrap_or_else(|_| "USDC".into())
                 .split(',')
@@ -266,6 +313,7 @@ impl AppConfig {
                 (Ok(domain), Ok(auth_token)) => Some(NgrokConfig { domain, auth_token }),
                 _ => None,
             },
+            alchemy: AlchemyConfig::from_env(),
         })
     }
 }
@@ -292,6 +340,7 @@ impl AppConfig {
             engine,
             kyc: KycConfig::for_test("http://127.0.0.1:1"),
             admin_api_key: Some("test-admin-key-1234".into()),
+            alchemy: None,
         }
     }
 }
@@ -303,6 +352,7 @@ impl EngineConfig {
             enabled: true,
             dry_run,
             poll_secs: 1,
+            deposit_backstop_secs: 0,
             settlement_symbols: vec!["USDC".into()],
             global_floor_micros: 1_000_000,
             max_order_micros: Some(50_000_000),

@@ -74,7 +74,7 @@ The server is one program with four parts that work together.
 A background worker that runs every 30 seconds and does these jobs in order:
 
 1. Finish pending identity checks.
-2. Look for new payments in users' wallets.
+2. Register new wallet addresses with Alchemy, then look for new payments in users' wallets. Alchemy sends an alert when money reaches a wallet, and the server then asks True Markets about that one user straight away, a few times, because the credit can take a moment. True Markets decides whether the money really arrived, so an alert alone never invests anything. A slower check of every user stays on as a safety net, in case an alert is missed.
 3. Decide how much to invest from each new payment.
 4. Fix orders that got stuck halfway.
 5. Place the stock orders.
@@ -155,6 +155,8 @@ While developing, set `NGROK_AUTH_TOKEN` and `NGROK_DOMAIN` and the server opens
 | `DRY_RUN` | Leave `true` until you really want to trade. `false` also needs `TM_EXECUTE_AUTH_TYPE`. |
 | `SIGNING_MASTER_KEYS` | The master key that locks users' keys, written as `version:64 hex characters`. |
 | `SIGNING_ALLOWED_ACTIVITY_TYPES` | The only kinds of action the signer may approve. Left empty, it refuses everything, so set it before trading for real. |
+| `ALCHEMY_WEBHOOK_IDS`, `ALCHEMY_WEBHOOK_SIGNING_KEYS`, `ALCHEMY_AUTH_TOKEN` | Turn on chain alerts, so deposits are noticed in seconds instead of on the next check. Leave empty to rely on the checks alone. |
+| `DEPOSIT_BACKSTOP_SECS` | How often every user is checked even without an alert. 30 by default; raise it once alerts work. |
 | `KYC_MODE` | `vendor` checks every NIN with the vendor. `auto` approves everyone with no check, so use it only for demos and testing. The server prints a warning when it runs in production. |
 | `ADMIN_API_KEY` | At least 16 characters, or the operator routes stay off. |
 
@@ -168,6 +170,7 @@ All replies look like `{ "success": true, "message": "...", "data": ... }`.
 | --- | --- |
 | Health | `GET /`, `GET /health` |
 | Telegram | `POST /webhook` |
+| Chain alerts | `POST /hooks/alchemy` (signed by Alchemy; off until its signing keys are set) |
 | Accounts | `POST /auth/register`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/credentials`, `/auth/telegram/login`, `/auth/telegram/webapp`, `/auth/telegram/link`, `GET /auth/me` |
 | Setup | `GET /v1/onboarding`, `POST /v1/onboarding/advance`, `/v1/kyc`, `/v1/rule`, `/v1/rule/custom`, `/v1/plans`, `/v1/assets` |
 | Money in | `GET /v1/deposit`, `/v1/portfolio`, `/v1/investments` |

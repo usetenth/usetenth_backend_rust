@@ -3,7 +3,7 @@ use crate::app_state::ApplicationState;
 use crate::config::{AppConfig, EngineConfig};
 use crate::integrations::tm_client::TrueMarketClient;
 use crate::signing::{SigningService, test_support};
-use axum::{Json, Router, extract::{Path, State}, http::StatusCode, routing::{get, post}};
+use axum::{Json, Router, extract::{Path, State}, http::{HeaderMap, StatusCode}, routing::{get, patch, post}};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::sync::{
@@ -46,6 +46,10 @@ pub(crate) struct Mock {
     pub(crate) transactions: Arc<Mutex<Vec<Value>>>,
     pub(crate) defi_quotes: Arc<Mutex<Vec<Value>>>,
     pub(crate) orders_without_quote: Arc<AtomicBool>,
+    pub(crate) transaction_calls: Arc<AtomicUsize>,
+    // (token header, body) of every request to the webhook provider's address API.
+    pub(crate) alchemy: Arc<Mutex<Vec<(String, Value)>>>,
+    pub(crate) alchemy_down: Arc<AtomicBool>,
 }
 
 impl Mock {
@@ -77,6 +81,9 @@ impl Mock {
             transactions: Default::default(),
             defi_quotes: Default::default(),
             orders_without_quote: Default::default(),
+            transaction_calls: Default::default(),
+            alchemy: Default::default(),
+            alchemy_down: Default::default(),
         }
     }
     pub(crate) fn creates(&self) -> usize {
@@ -256,7 +263,16 @@ async fn serve(mock: Mock) -> String {
         ] }))
     }
     async fn transactions(State(m): State<Mock>) -> Json<Value> {
+        m.transaction_calls.fetch_add(1, Ordering::SeqCst);
         Json(json!({ "data": *m.transactions.lock().unwrap() }))
+    }
+    async fn update_webhook_addresses(State(m): State<Mock>, headers: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+        let token = headers.get("x-alchemy-token").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        m.alchemy.lock().unwrap().push((token, body));
+        if m.alchemy_down.load(Ordering::SeqCst) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": "down" })));
+        }
+        (StatusCode::OK, Json(json!({ "data": {} })))
     }
     async fn defi_quote(State(m): State<Mock>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
         m.defi_quotes.lock().unwrap().push(body.clone());
@@ -291,6 +307,7 @@ async fn serve(mock: Mock) -> String {
         .route("/telegram/{bot}/sendPhoto", post(send_photo))
         .route("/verification/vnin-basic", post(prembly_nin))
         .route("/api/v1/kyc/nin", get(dojah_nin))
+        .route("/alchemy/update-webhook-addresses", patch(update_webhook_addresses))
         .with_state(mock);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -325,6 +342,17 @@ pub(crate) async fn state(pool: &PgPool, mock: &Mock, dry_run: bool) -> Applicat
     )
 }
 
+
+/// Turns on the chain webhook provider, pointed at the mock, with one Solana and two EVM webhooks.
+pub(crate) fn with_alchemy(state: &mut ApplicationState) {
+    let origin = state.config.true_market_base_url.trim_end_matches("/v1/gateway").to_string();
+    state.config.alchemy = Some(crate::config::AlchemyConfig {
+        api_base: format!("{origin}/alchemy"),
+        auth_token: Some("tok".into()),
+        webhooks: vec![("evm".into(), "wh_base".into()), ("evm".into(), "wh_robinhood".into()), ("solana".into(), "wh_sol".into())],
+        signing_keys: vec!["sign-key".into()],
+    });
+}
 
 pub(crate) async fn seed_assets(pool: &PgPool) {
     for (key, symbol) in [("spy-id", "SPY"), ("qqq-id", "QQQ")] {

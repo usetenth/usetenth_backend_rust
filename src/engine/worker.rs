@@ -10,10 +10,15 @@ use crate::services::telegram_service::TelegramService;
 use crate::signing::{IntentKind, PolicyError, SigningPayload};
 use crate::utils::usd;
 use sqlx::PgPool;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use uuid::Uuid;
 
 const MAX_ATTEMPTS: i32 = 5;
+// After a chain hint the gateway is asked again at these delays, because it may credit the money a little later.
+const HINT_DELAYS_SECS: [u64; 6] = [0, 5, 15, 45, 120, 300];
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 // An order stuck mid-flight this long is resolved by asking the gateway what happened.
 const STALE_SECS: i64 = 300;
 const MAX_ORDERS_PER_TICK: usize = 20;
@@ -26,7 +31,11 @@ pub async fn run(state: ApplicationState) {
     }
     loop {
         tick(&state).await;
-        tokio::time::sleep(Duration::from_secs(cfg.poll_secs)).await;
+        // A newly found deposit wakes the engine so it is invested without waiting for the next poll.
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(cfg.poll_secs)) => {}
+            _ = WAKE.notified() => {}
+        }
     }
 }
 
@@ -40,6 +49,7 @@ fn log<T>(result: anyhow::Result<T>, stage: &str) {
 pub async fn tick(state: &ApplicationState) {
     let cfg = &state.config.engine;
     log(crate::services::kyc::process_due(state).await, "identity checks");
+    log(crate::services::chain_watch::sync_addresses(state).await, "watch addresses");
     log(detect_deposits(state).await, "detect deposits");
     log(plan_investments(&state.pool, cfg).await, "plan investments");
     log(recover_stale(state).await, "recover stale orders");
@@ -76,25 +86,84 @@ pub fn outcome(status: Option<GatewayOrderStatus>) -> Outcome {
 }
 
 
+/// Looks up the incoming payments of every verified user not checked within the backstop interval, longest unchecked first.
 pub async fn detect_deposits(state: &ApplicationState) -> anyhow::Result<()> {
     let users: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, gateway_user_id FROM users WHERE gateway_user_id IS NOT NULL AND verified = 'verified'",
+        "SELECT u.id, u.gateway_user_id FROM users u LEFT JOIN deposit_checks c ON c.user_id = u.id
+         WHERE u.gateway_user_id IS NOT NULL AND u.verified = 'verified'
+           AND (c.last_checked_at IS NULL OR c.last_checked_at < now() - ($1::BIGINT * interval '1 second'))
+         ORDER BY c.last_checked_at NULLS FIRST",
     )
+    .bind(state.config.engine.deposit_backstop_secs as i64)
     .fetch_all(&state.pool)
     .await?;
 
     for (user_id, gateway_id) in users {
-        if let Err(error) = detect_for_user(state, user_id, &gateway_id).await {
+        if let Err(error) = check_one(state, user_id, &gateway_id).await {
             eprintln!("Deposit detection failed for user {user_id}: {error:#}");
         }
     }
     Ok(())
 }
 
+// The check is recorded only when it worked, so a failing lookup is retried on the next pass.
+async fn check_one(state: &ApplicationState, user_id: Uuid, gateway_id: &str) -> anyhow::Result<usize> {
+    let found = detect_for_user(state, user_id, gateway_id).await?;
+    sqlx::query(
+        "INSERT INTO deposit_checks (user_id, last_checked_at) VALUES ($1, now())
+         ON CONFLICT (user_id) DO UPDATE SET last_checked_at = now()",
+    )
+    .bind(user_id)
+    .execute(&state.pool)
+    .await?;
+    Ok(found)
+}
+
+/// Looks up one user's incoming payments now; returns how many new deposits were recorded.
+pub async fn check_user(state: &ApplicationState, user_id: Uuid) -> anyhow::Result<usize> {
+    let gateway: Option<String> = sqlx::query_scalar::<_, Option<String>>("SELECT gateway_user_id FROM users WHERE id = $1 AND verified = 'verified'")
+        .bind(user_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .flatten();
+    match gateway {
+        Some(gateway_id) => check_one(state, user_id, &gateway_id).await,
+        None => Ok(0),
+    }
+}
+
+fn hints_running() -> &'static Mutex<HashSet<Uuid>> {
+    static RUNNING: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    RUNNING.get_or_init(Default::default)
+}
+
+/// The chain says something moved for this user: ask the gateway now and a few more times, one run per user at a time.
+pub fn hint_user(state: ApplicationState, user_id: Uuid) {
+    if !hints_running().lock().unwrap().insert(user_id) {
+        return;
+    }
+    tokio::spawn(async move {
+        hint_checks(&state, user_id, &HINT_DELAYS_SECS).await;
+        hints_running().lock().unwrap().remove(&user_id);
+    });
+}
+
+pub(crate) async fn hint_checks(state: &ApplicationState, user_id: Uuid, delays: &[u64]) {
+    for delay in delays {
+        tokio::time::sleep(Duration::from_secs(*delay)).await;
+        match check_user(state, user_id).await {
+            Ok(found) if found > 0 => {
+                WAKE.notify_one();
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("Deposit check after a chain hint failed for user {user_id}: {error:#}"),
+        }
+    }
+}
+
 // A payment in a token that is not a settlement asset is skipped, so say so once instead of every poll.
 fn warn_once_ignored(source_id: &str, symbol: &str, settlement: &[String]) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let first = SEEN.get_or_init(Default::default).lock().unwrap().insert(source_id.to_string());
     if first {
@@ -102,11 +171,12 @@ fn warn_once_ignored(source_id: &str, symbol: &str, settlement: &[String]) {
     }
 }
 
-async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &str) -> anyhow::Result<()> {
+async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &str) -> anyhow::Result<usize> {
     // Any stablecoin the gateway lists counts, not only the settlement asset, because the gateway credits all of them.
     let mut symbols = state.config.engine.settlement_symbols.clone();
     symbols.extend(crate::services::catalog::stable_symbols(&state.pool).await?);
     let response = state.tm_client.list_transactions(gateway_id).await?;
+    let mut recorded = 0;
     for tx in response.data {
         let (Some(TransactionType::ReceivedTransfer), Some(TransactionStatus::Completed), Some(received)) =
             (tx.transaction_type, tx.status, tx.received_transfer)
@@ -119,7 +189,7 @@ async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &s
             warn_once_ignored(&received.id.to_string(), &symbol, &symbols);
             continue;
         }
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO deposits (user_id, source_id, tx_hash, chain, asset, amount_micros, observed_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (source_id) DO NOTHING",
         )
@@ -132,8 +202,9 @@ async fn detect_for_user(state: &ApplicationState, user_id: Uuid, gateway_id: &s
         .bind(received.observed_at)
         .execute(&state.pool)
         .await?;
+        recorded += inserted.rows_affected() as usize;
     }
-    Ok(())
+    Ok(recorded)
 }
 
 

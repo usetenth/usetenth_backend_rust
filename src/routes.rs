@@ -2,7 +2,7 @@ use axum::{middleware, routing::{Router, delete, get, post, put}, Json};
 use reqwest::StatusCode;
 use crate::{
     app_state::ApplicationState,
-    handlers::{admin, auth, mobile, money_out},
+    handlers::{admin, auth, chain_hooks, mobile, money_out},
     handlers::webhook::{telegram_auth_middleware, webhook_handler},
 };
 use crate::services::response::ApiResponse;
@@ -69,6 +69,7 @@ pub fn app_router(state: ApplicationState) -> Router {
         .nest("/v1", v1)
         .nest("/admin", admin_routes)
         .route("/health", get(health))
+        .route("/hooks/alchemy", post(chain_hooks::alchemy))
         .merge(webhook)
         .with_state(state)
 }

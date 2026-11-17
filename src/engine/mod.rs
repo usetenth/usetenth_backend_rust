@@ -14,3 +14,6 @@ mod money_out_tests;
 
 #[cfg(test)]
 mod notify_tests;
+
+#[cfg(test)]
+mod chain_watch_tests;
